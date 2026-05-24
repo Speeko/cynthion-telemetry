@@ -1,0 +1,20 @@
+services:
+  cynthion-telemetry:
+    build: .
+    image: cynthion-telemetry:latest
+    container_name: cynthion-telemetry
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LISTEN_ADDR: ":8090"
+      DB_PATH: "/data/events.db"
+    volumes:
+      - ./data:/data
+    ports:
+      # Bind to loopback only — Caddy (in /srv/asteroids-mmo/) proxies
+      # api.cynthiongame.com to host.docker.internal:8090.
+      - "127.0.0.1:8090:8090"
+    deploy:
+      resources:
+        limits:
+          memory: 128M

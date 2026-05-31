@@ -17,6 +17,7 @@ Tiny Go HTTP ingest endpoint for Cynthion game telemetry (events + crash reports
 | GET | `/health` | none | liveness probe |
 | POST | `/v1/events` | `X-API-Key` | batched gameplay events |
 | POST | `/v1/crash` | `X-API-Key` | crash + log upload |
+| POST | `/v1/bugreport` | `X-API-Key` | user-submitted bug report (zip upload) |
 
 ### POST /v1/events
 
@@ -54,9 +55,31 @@ Response: `{"ok":true,"received":N}`
 
 Response: `{"ok":true,"id":<rowid>}`
 
+### POST /v1/bugreport
+
+`multipart/form-data` (NOT JSON — carries a binary zip). Text fields plus one file field:
+
+| Field | Type | Notes |
+|---|---|---|
+| `install_id` | text | required |
+| `session_id` | text | |
+| `app_version` | text | |
+| `os` | text | |
+| `gpu` | text | |
+| `category` | text | bug category |
+| `severity` | text | |
+| `description` | text | what happened |
+| `expected_behavior` | text | |
+| `archive` | file | the zipped report (`report.json` + `logs/` + `screenshot.png` + `save_snapshot.json`) |
+
+The zip is written to `data/bugreports/<received_ms>_<install8>.zip`; a metadata row goes into the `bugreports` table (`archive_name` points at the file). Client sends this consent-independently — a manual bug report is an explicit user action.
+
+Response: `{"ok":true,"id":<rowid>,"archive":"<filename>.zip"}`
+
 ## Limits
 
-- 4 MB max body
+- 4 MB max body (`/v1/events`, `/v1/crash`)
+- 32 MB max body (`/v1/bugreport` — screenshot + save snapshot)
 - 200 events per batch
 - 2 req/sec/IP sustained, burst 20 (rate limiter)
 
@@ -74,6 +97,9 @@ docker logs cynthion-telemetry
 ```bash
 ssh root@cynthion-au 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT event_type, COUNT(*) FROM events GROUP BY event_type"'
 ssh root@cynthion-au 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT received_at, install_id, error_summary FROM crashes ORDER BY received_at DESC LIMIT 10"'
+ssh root@cynthion-au 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT received_at, install_id, category, severity, description, archive_name FROM bugreports ORDER BY received_at DESC LIMIT 10"'
+# Pull a bug-report zip down to inspect locally:
+scp root@cynthion-au:/srv/cynthion-telemetry/data/bugreports/<archive_name> /tmp/
 ```
 
 ## Privacy notes

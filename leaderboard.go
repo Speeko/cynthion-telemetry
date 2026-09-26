@@ -63,8 +63,9 @@ func itchOrigin(origin string) bool {
 
 type leaderboardSubmit struct {
 	Game       string `json:"game"`
-	Mode       string `json:"mode"` // full_run | level
+	Mode       string `json:"mode"` // full_run | level | course (ManRocket community course)
 	Level      int    `json:"level"`
+	Course     string `json:"course"` // mode=course: a manrocket_levels id
 	TimeMS     int64  `json:"time_ms"`
 	Name       string `json:"name"`
 	InstallID  string `json:"install_id"`
@@ -95,9 +96,24 @@ func (s *server) leaderboardPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown game", http.StatusBadRequest)
 		return
 	}
-	if in.Mode != "full_run" && in.Mode != "level" {
+	if !validLeaderboardMode(in.Game, in.Mode) {
 		http.Error(w, "bad mode", http.StatusBadRequest)
 		return
+	}
+	in.Course = strings.TrimSpace(in.Course)
+	if in.Mode == "course" {
+		in.Level = 0
+		ok, err := s.store.manrocketCourseExists(in.Course)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "unknown course", http.StatusNotFound)
+			return
+		}
+	} else {
+		in.Course = ""
 	}
 	if in.Mode == "level" && (in.Level < 1 || in.Level > 99) {
 		http.Error(w, "bad level", http.StatusBadRequest)
@@ -129,9 +145,9 @@ func (s *server) leaderboardPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := s.store.db.Exec(
-		`INSERT INTO leaderboard (received_at, game, mode, level, time_ms, name, install_id, app_version)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		time.Now().UnixMilli(), in.Game, in.Mode, in.Level, in.TimeMS, name, install, strings.TrimSpace(in.AppVersion),
+		`INSERT INTO leaderboard (received_at, game, mode, level, course, time_ms, name, install_id, app_version)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UnixMilli(), in.Game, in.Mode, in.Level, in.Course, in.TimeMS, name, install, strings.TrimSpace(in.AppVersion),
 	)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
@@ -178,7 +194,7 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 	if mode == "" {
 		mode = "full_run"
 	}
-	if mode != "full_run" && mode != "level" {
+	if !validLeaderboardMode(game, mode) {
 		http.Error(w, "bad mode", http.StatusBadRequest)
 		return
 	}
@@ -197,31 +213,90 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 		}
 		level = n
 	}
+	course := ""
+	if mode == "course" {
+		course = strings.TrimSpace(r.URL.Query().Get("course"))
+		ok, err := s.store.manrocketCourseExists(course)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.Error(w, "unknown course", http.StatusNotFound)
+			return
+		}
+	}
 
-	rows, err := s.store.queryLeaderboard(game, mode, level, limit)
+	rows, err := s.store.queryLeaderboard(game, mode, level, course, limit)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"ok":    true,
-		"game":  game,
-		"mode":  mode,
-		"level": level,
+		"ok":      true,
+		"game":    game,
+		"mode":    mode,
+		"level":   level,
+		"course":  course,
 		"entries": rows,
 	})
 }
 
-func (st *Store) queryLeaderboard(game, mode string, level, limit int) ([]map[string]any, error) {
+// validLeaderboardMode: full_run / level for every game; course only for ManRocket (community courses).
+func validLeaderboardMode(game, mode string) bool {
+	switch mode {
+	case "full_run", "level":
+		return true
+	case "course":
+		return game == "manrocket"
+	}
+	return false
+}
+
+// manrocketCourseExists: a course board only exists for a course on the community server.
+func (st *Store) manrocketCourseExists(id string) (bool, error) {
+	if id == "" || len(id) > 80 {
+		return false, nil
+	}
+	var n int
+	if err := st.db.QueryRow(`SELECT COUNT(1) FROM manrocket_levels WHERE id=?`, id).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// ensureLeaderboardCourseColumn: the live leaderboard table predates community-course boards, and
+// CREATE TABLE IF NOT EXISTS never adds columns — add `course` once ("duplicate column" = done).
+func (st *Store) ensureLeaderboardCourseColumn() error {
+	if _, err := st.db.Exec(`ALTER TABLE leaderboard ADD COLUMN course TEXT NOT NULL DEFAULT ''`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column") {
+		return err
+	}
+	_, err := st.db.Exec(`CREATE INDEX IF NOT EXISTS idx_lb_game_mode_course_time ON leaderboard(game, mode, course, time_ms)`)
+	return err
+}
+
+func (st *Store) queryLeaderboard(game, mode string, level int, course string, limit int) ([]map[string]any, error) {
 	q := `SELECT name, time_ms, level, received_at, app_version, COALESCE(install_id, '')
 	      FROM leaderboard WHERE game=? AND mode=?`
 	args := []any{game, mode}
-	if mode == "level" {
+	switch mode {
+	case "level":
 		q += ` AND level=?`
 		args = append(args, level)
+	case "course":
+		// one row per install (its best): a community board is small, one grinder shouldn't fill it.
+		// SQLite bare columns next to a lone MIN() come from the row that holds the minimum.
+		q = `SELECT name, MIN(time_ms) AS t, level, received_at, app_version, install_id
+		     FROM leaderboard WHERE game=? AND mode=? AND course=? GROUP BY install_id`
+		args = append(args, course)
 	}
-	q += ` ORDER BY time_ms ASC LIMIT ?`
+	if mode == "course" {
+		q += ` ORDER BY t ASC, received_at ASC LIMIT ?`
+	} else {
+		q += ` ORDER BY time_ms ASC LIMIT ?`
+	}
 	args = append(args, limit)
 	rs, err := st.db.Query(q, args...)
 	if err != nil {

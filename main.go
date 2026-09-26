@@ -184,6 +184,9 @@ func openStore(path string) (*Store, error) {
 		return nil, fmt.Errorf("index steam_id: %w", err)
 	}
 	st := &Store{db: db}
+	if err := st.ensureLeaderboardCourseColumn(); err != nil {
+		return nil, fmt.Errorf("leaderboard course column: %w", err)
+	}
 	if err := st.ensureWhiteboardSchema(); err != nil {
 		return nil, fmt.Errorf("whiteboard schema: %w", err)
 	}

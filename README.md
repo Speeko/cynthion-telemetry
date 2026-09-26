@@ -76,6 +76,19 @@ The zip is written to `data/bugreports/<received_ms>_<install8>.zip`; a metadata
 
 Response: `{"ok":true,"id":<rowid>,"archive":"<filename>.zip"}`
 
+## Leaderboard
+
+Source: `leaderboard.go`. Public (no API key), CORS + rate-limited. Table `leaderboard`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/leaderboard` | `{game, mode, level, course, time_ms, name, install_id, app_version}` → `{ok, id}`. `mode`: `full_run` \| `level` (1–99) \| `course` (ManRocket only: `course` = a `manrocket_levels` id, 404 `unknown course` otherwise). `time_ms` 500 ms–12 h. |
+| GET | `/v1/leaderboard/<game>?mode=level&level=N[&limit=N]` | `{ok, game, mode, level, course, entries:[{rank, name, tag, time_ms, level, received_at, app_version}]}`, N ≤ 100 (default 20), fastest first. `tag` = 4-hex per-install tag (names aren't unique). |
+| GET | `/v1/leaderboard/manrocket?mode=course&course=<id>[&limit=N]` | Same shape; ONE row per install (its best). Unknown course → 404. |
+
+The `course` column was added to the live table by a guarded `ALTER TABLE` (`ensureLeaderboardCourseColumn`).
+Delete a row: `sqlite3 data/events.db "DELETE FROM leaderboard WHERE id=?"`.
+
 ## ManRocket whiteboards
 
 Public (no API key), CORS + rate-limited. Source: `manrocket_whiteboards.go`. PNGs live as BLOBs in SQLite.

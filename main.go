@@ -28,12 +28,12 @@ import (
 	"syscall"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"golang.org/x/time/rate"
+	_ "modernc.org/sqlite"
 )
 
 const (
-	maxBodyBytes       = 4 << 20  // 4 MB — boot logs run a few KB but allow headroom
+	maxBodyBytes       = 4 << 20 // 4 MB — boot logs run a few KB but allow headroom
 	maxEventsPerBatch  = 200
 	maxBugReportBytes  = 32 << 20 // 32 MB — bug report zip (report.json + logs + screenshot + save snapshot)
 	bugReportMemBuffer = 8 << 20  // keep up to 8 MB in memory while parsing, spill the rest to temp files
@@ -192,6 +192,9 @@ func openStore(path string) (*Store, error) {
 	}
 	if err := st.ensureNamesSchema(); err != nil {
 		return nil, fmt.Errorf("names schema: %w", err)
+	}
+	if err := st.ensureFeedbackSchema(); err != nil {
+		return nil, fmt.Errorf("feedback schema: %w", err)
 	}
 	return st, nil
 }
@@ -580,6 +583,7 @@ func main() {
 	mux.HandleFunc("/v1/manrocket/phrases/", s.withCORS(s.manrocketPhrases)) // rate-limits itself (wavs looser)
 	mux.HandleFunc("/v1/manrocket/phrases", s.withCORS(s.manrocketPhrases))
 	mux.HandleFunc("/v1/manrocket/names/", s.withCORS(s.withRateLimit(s.manrocketNames)))
+	mux.HandleFunc("/v1/manrocket/feedback", s.withCORS(s.withRateLimit(s.manrocketFeedback)))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

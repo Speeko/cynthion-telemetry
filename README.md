@@ -115,6 +115,19 @@ claim. `anon` is shared and never owned. `POST /v1/leaderboard` for manrocket no
 | GET | `/v1/manrocket/names/check?name=..&install_id=..` | `{ok, available, reason:"ok"\|"taken", name:<cleaned>}` |
 | POST | `/v1/manrocket/names/claim` | `{name, install_id}` → `{ok:true, available:true, name}` or 409 `{ok:false, reason:"taken"}`. Releases the install's previous claim (rename). |
 
+## ManRocket feedback
+
+Source: `manrocket_feedback.go`. The in-game "New Message" window (fake Outlook Express 98) posts here.
+**Nothing is emailed** (no SMTP) — rows sit in `manrocket_feedback`; the Director reads them with the admin
+GET (game repo: `tools/read_feedback.sh`, key from `~/.config/cynthion-telemetry/manrocket_admin_key`).
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/manrocket/feedback` | `{from, subject, body, cc[], pilot, version, platform, install_id}` → `{ok, id}`. Subject ≤ 120 runes, body ≤ 4000 (400 `too long`), at least one non-empty (400 `empty`). `cc` is the joke address book — stored, never sent (≤ 20 × 64). Caps: 10/install + 30/IP-hash per 24 h (429). |
+| GET | `/v1/manrocket/feedback?limit=N` | `X-Admin-Key: $MANROCKET_ADMIN_KEY` → `{ok, feedback:[{id, received_at, from, subject, body, cc, pilot, version, platform, install_id}]}` newest first, N ≤ 200 (default 50). |
+
+Delete: `sqlite3 data/events.db "DELETE FROM manrocket_feedback WHERE id=?"`.
+
 ## Limits
 
 - 4 MB max body (`/v1/events`, `/v1/crash`)

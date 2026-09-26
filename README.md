@@ -86,7 +86,10 @@ Source: `leaderboard.go`. Public (no API key), CORS + rate-limited. Table `leade
 | GET | `/v1/leaderboard/<game>?mode=level&level=N[&limit=N]` | `{ok, game, mode, level, course, entries:[{rank, name, tag, time_ms, level, received_at, app_version}]}`, N ≤ 100 (default 20), fastest first. `tag` = 4-hex per-install tag (names aren't unique). |
 | GET | `/v1/leaderboard/manrocket?mode=course&course=<id>[&limit=N]` | Same shape; ONE row per install (its best). Unknown course → 404. |
 
-The `course` column was added to the live table by a guarded `ALTER TABLE` (`ensureLeaderboardCourseColumn`).
+| POST | `/v1/leaderboard` (Launch Laser 2) | `{game:"launchlaser", mode:"score", score, run_ms, kills, name, install_id, app_version}` → `{ok, id}`. Plausibility: score 1–1,000,000, ≤ 8/s of run (+60), ≤ 40/kill, else 400 `bad score`. Source: `launchlaser_scores.go`. |
+| GET | `/v1/leaderboard/launchlaser?mode=score&period=all\|week\|day[&limit=N][&install_id=ID]` | `{ok, game, mode, period, entries:[{rank, name, tag, score, received_at, app_version}], you:{rank, score}\|null}`. One row per install (its best), highest first. `day` = since 00:00 UTC, `week` = last 7 days. `tag` is salted `launchlaser-tag:`. |
+
+The `course` and `score` columns were added to the live table by guarded `ALTER TABLE`s (`ensureLeaderboardCourseColumn`, `ensureLeaderboardScoreColumn`).
 Delete a row: `sqlite3 data/events.db "DELETE FROM leaderboard WHERE id=?"`.
 
 ## ManRocket whiteboards

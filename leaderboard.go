@@ -16,7 +16,8 @@ import (
 // allowlisted + rate-limited; reads are public for cynthiongame.com pages.
 
 var allowedLeaderboardGames = map[string]bool{
-	"manrocket": true,
+	"manrocket":   true,
+	"launchlaser": true,
 }
 
 var nameCleaner = regexp.MustCompile(`[^a-zA-Z0-9 _.\-]`)
@@ -70,6 +71,9 @@ type leaderboardSubmit struct {
 	Name       string `json:"name"`
 	InstallID  string `json:"install_id"`
 	AppVersion string `json:"app_version"`
+	Score      int64  `json:"score"`  // mode=score (Launch Laser 2)
+	RunMS      int64  `json:"run_ms"` // mode=score: run length, for the plausibility check
+	Kills      int64  `json:"kills"`  // mode=score
 }
 
 func (s *server) leaderboard(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +102,10 @@ func (s *server) leaderboardPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validLeaderboardMode(in.Game, in.Mode) {
 		http.Error(w, "bad mode", http.StatusBadRequest)
+		return
+	}
+	if in.Mode == "score" {
+		s.launchLaserPost(w, in)
 		return
 	}
 	in.Course = strings.TrimSpace(in.Course)
@@ -193,9 +201,16 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
 	if mode == "" {
 		mode = "full_run"
+		if game == launchLaserGame {
+			mode = "score"
+		}
 	}
 	if !validLeaderboardMode(game, mode) {
 		http.Error(w, "bad mode", http.StatusBadRequest)
+		return
+	}
+	if mode == "score" {
+		s.launchLaserGet(w, r)
 		return
 	}
 	limit := 20
@@ -243,8 +258,12 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// validLeaderboardMode: full_run / level for every game; course only for ManRocket (community courses).
+// validLeaderboardMode: ManRocket has full_run / level / course (community courses); Launch Laser 2
+// has only score (highest wins).
 func validLeaderboardMode(game, mode string) bool {
+	if game == launchLaserGame {
+		return mode == "score"
+	}
 	switch mode {
 	case "full_run", "level":
 		return true
@@ -330,6 +349,10 @@ func installTag(install string) string {
 	if install == "" {
 		return ""
 	}
-	h := sha1.Sum([]byte("manrocket-tag:" + install))
+	return sha1Hex4("manrocket-tag:" + install)
+}
+
+func sha1Hex4(s string) string {
+	h := sha1.Sum([]byte(s))
 	return hex.EncodeToString(h[:])[:4]
 }

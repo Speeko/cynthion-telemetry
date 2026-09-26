@@ -183,7 +183,11 @@ func openStore(path string) (*Store, error) {
 	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_events_steam ON events(steam_id)"); err != nil {
 		return nil, fmt.Errorf("index steam_id: %w", err)
 	}
-	return &Store{db: db}, nil
+	st := &Store{db: db}
+	if err := st.ensureWhiteboardSchema(); err != nil {
+		return nil, fmt.Errorf("whiteboard schema: %w", err)
+	}
+	return st, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -565,6 +569,8 @@ func main() {
 	mux.HandleFunc("/v1/leaderboard", s.withCORS(s.withRateLimit(s.leaderboard)))
 	mux.HandleFunc("/v1/manrocket/levels/", s.withCORS(s.withRateLimit(s.manrocketLevels)))
 	mux.HandleFunc("/v1/manrocket/levels", s.withCORS(s.withRateLimit(s.manrocketLevels)))
+	mux.HandleFunc("/v1/manrocket/whiteboards/", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
+	mux.HandleFunc("/v1/manrocket/whiteboards", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

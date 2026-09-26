@@ -187,6 +187,12 @@ func openStore(path string) (*Store, error) {
 	if err := st.ensureWhiteboardSchema(); err != nil {
 		return nil, fmt.Errorf("whiteboard schema: %w", err)
 	}
+	if err := st.ensurePhrasesSchema(); err != nil {
+		return nil, fmt.Errorf("phrases schema: %w", err)
+	}
+	if err := st.ensureNamesSchema(); err != nil {
+		return nil, fmt.Errorf("names schema: %w", err)
+	}
 	return st, nil
 }
 
@@ -571,6 +577,9 @@ func main() {
 	mux.HandleFunc("/v1/manrocket/levels", s.withCORS(s.withRateLimit(s.manrocketLevels)))
 	mux.HandleFunc("/v1/manrocket/whiteboards/", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
 	mux.HandleFunc("/v1/manrocket/whiteboards", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
+	mux.HandleFunc("/v1/manrocket/phrases/", s.withCORS(s.manrocketPhrases)) // rate-limits itself (wavs looser)
+	mux.HandleFunc("/v1/manrocket/phrases", s.withCORS(s.manrocketPhrases))
+	mux.HandleFunc("/v1/manrocket/names/", s.withCORS(s.withRateLimit(s.manrocketNames)))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

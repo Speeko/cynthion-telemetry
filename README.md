@@ -89,6 +89,32 @@ Public (no API key), CORS + rate-limited. Source: `manrocket_whiteboards.go`. PN
 
 Moderation: `UPDATE manrocket_whiteboards SET hidden=1 WHERE id=?` (or `DELETE`).
 
+## ManRocket meeting phrases
+
+Source: `manrocket_phrases.go`. Unlocked in-game by uploading a level. The server renders the line as
+Microsoft Sam via `https://www.tetyys.com/SAPI4/SAPI4` (speed 165) at the game's four seat pitches
+(70/100/130/165) — **sequentially** (tetyys 503s parallel requests), ~16 s per submit — and stores the wavs as BLOBs.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/manrocket/phrases` | `{text, name, install_id}` → `{ok, id, text, wavs:{"70":"/v1/…/<id>/70.wav",…}}`. Text ≤ 40 chars, `[A-Za-z0-9 .,!?'-]`, blocklist (whole-word + substring, leet-folded). One per install; resubmit replaces it (new id). Caps: 6/install + 15/IP-hash per 24 h. Errors: `{ok:false, reason}` 400/429/502. |
+| GET | `/v1/manrocket/phrases/random?limit=N` | `{ok, phrases:[{id, text, name, wavs}]}`, N ≤ 30 (default 20) |
+| GET | `/v1/manrocket/phrases/<id>/<pitch>.wav` | `audio/wav`, immutable (own looser rate bucket: 20/s, burst 160) |
+
+Moderation: `UPDATE manrocket_phrases SET hidden=1 WHERE text LIKE '%…%'`.
+
+## ManRocket pilot names
+
+Source: `manrocket_names.go`. Names are cleaned exactly like leaderboard names (`cleanLeaderboardName`) and
+compared case-insensitively. Owner = the install that FIRST posted the name to the manrocket leaderboard
+(backfill is implicit — every name already on the board belongs to its poster), else the install holding a
+claim. `anon` is shared and never owned. `POST /v1/leaderboard` for manrocket now **409s** a name owned by another install.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/manrocket/names/check?name=..&install_id=..` | `{ok, available, reason:"ok"\|"taken", name:<cleaned>}` |
+| POST | `/v1/manrocket/names/claim` | `{name, install_id}` → `{ok:true, available:true, name}` or 409 `{ok:false, reason:"taken"}`. Releases the install's previous claim (rename). |
+
 ## Limits
 
 - 4 MB max body (`/v1/events`, `/v1/crash`)

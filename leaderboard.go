@@ -92,26 +92,22 @@ func (s *server) leaderboardPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad time", http.StatusBadRequest)
 		return
 	}
-	name := strings.TrimSpace(in.Name)
-	name = nameCleaner.ReplaceAllString(name, "")
-	name = strings.Join(strings.Fields(name), " ")
-	if name == "" {
-		name = "anon"
-	}
-	if len(name) > 16 {
-		name = name[:16]
-	}
-	// ensure printable
-	name = strings.Map(func(r rune) rune {
-		if unicode.IsPrint(r) {
-			return r
-		}
-		return -1
-	}, name)
+	name := cleanLeaderboardName(in.Name)
 	install := strings.TrimSpace(in.InstallID)
 	if install == "" || len(install) > 64 {
 		http.Error(w, "bad install_id", http.StatusBadRequest)
 		return
+	}
+	if in.Game == "manrocket" {
+		owner, err := s.store.manrocketNameOwner(name)
+		if err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+		if owner != "" && owner != install {
+			http.Error(w, "name taken", http.StatusConflict)
+			return
+		}
 	}
 
 	res, err := s.store.db.Exec(
@@ -126,6 +122,26 @@ func (s *server) leaderboardPost(w http.ResponseWriter, r *http.Request) {
 	id, _ := res.LastInsertId()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"ok": true, "id": id})
+}
+
+// cleanLeaderboardName: the one display-name cleaner (leaderboard rows + the ManRocket name registry).
+func cleanLeaderboardName(raw string) string {
+	name := strings.TrimSpace(raw)
+	name = nameCleaner.ReplaceAllString(name, "")
+	name = strings.Join(strings.Fields(name), " ")
+	if name == "" {
+		name = "anon"
+	}
+	if len(name) > 16 {
+		name = strings.TrimSpace(name[:16])
+	}
+	// ensure printable
+	return strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) {
+			return r
+		}
+		return -1
+	}, name)
 }
 
 func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {

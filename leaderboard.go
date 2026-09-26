@@ -27,13 +27,16 @@ func (s *server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 		case strings.HasPrefix(origin, "http://127.0.0.1:"), strings.HasPrefix(origin, "http://localhost:"):
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+		case itchOrigin(origin):
+			// the HTML5 build on itch.io runs from html-classic.itch.zone / *.itch.io
+			w.Header().Set("Access-Control-Allow-Origin", origin)
 		case origin == "":
 			// non-browser clients (Godot HTTPRequest)
 		default:
 			// leave no ACAO for unknown origins on browser calls
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key")
 		w.Header().Set("Vary", "Origin")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -41,6 +44,19 @@ func (s *server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		}
 		next(w, r)
 	}
+}
+
+// itchOrigin: https origins on itch.io's game hosts (the web build's iframe).
+func itchOrigin(origin string) bool {
+	if !strings.HasPrefix(origin, "https://") {
+		return false
+	}
+	host := strings.TrimPrefix(origin, "https://")
+	if i := strings.IndexAny(host, ":/"); i >= 0 {
+		host = host[:i]
+	}
+	return host == "itch.io" || host == "itch.zone" ||
+		strings.HasSuffix(host, ".itch.io") || strings.HasSuffix(host, ".itch.zone")
 }
 
 type leaderboardSubmit struct {

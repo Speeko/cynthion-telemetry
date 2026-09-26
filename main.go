@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -78,6 +79,10 @@ CREATE TABLE IF NOT EXISTS events (
     app_version TEXT,
     os TEXT,
     gpu TEXT,
+    steam_id TEXT,
+    persona_name TEXT,
+    country TEXT,
+    language TEXT,
     event_type TEXT NOT NULL,
     payload TEXT
 );
@@ -118,6 +123,39 @@ CREATE TABLE IF NOT EXISTS bugreports (
 );
 CREATE INDEX IF NOT EXISTS idx_bugreports_install ON bugreports(install_id);
 CREATE INDEX IF NOT EXISTS idx_bugreports_received ON bugreports(received_at);
+
+CREATE TABLE IF NOT EXISTS leaderboard (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at INTEGER NOT NULL,
+    game TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    level INTEGER NOT NULL DEFAULT 0,
+    time_ms INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    install_id TEXT NOT NULL,
+    app_version TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lb_game_mode_time ON leaderboard(game, mode, time_ms);
+CREATE INDEX IF NOT EXISTS idx_lb_game_mode_level_time ON leaderboard(game, mode, level, time_ms);
+CREATE TABLE IF NOT EXISTS manrocket_levels (
+	id TEXT PRIMARY KEY,
+	received_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL,
+	title TEXT NOT NULL,
+	author TEXT NOT NULL,
+	install_id TEXT NOT NULL,
+	votes INTEGER NOT NULL DEFAULT 0,
+	payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS manrocket_level_votes (
+	level_id TEXT NOT NULL,
+	install_id TEXT NOT NULL,
+	value INTEGER NOT NULL,
+	PRIMARY KEY (level_id, install_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mr_levels_votes ON manrocket_levels(votes DESC, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mr_levels_new ON manrocket_levels(received_at DESC);
+
 `
 
 type Store struct{ db *sql.DB }
@@ -131,6 +169,20 @@ func openStore(path string) (*Store, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	// Idempotent migrations: CREATE TABLE IF NOT EXISTS won't add columns to a
+	// pre-existing events table. Add identity columns; ignore "duplicate column"
+	// on DBs that already have them.
+	for _, col := range []string{"steam_id", "persona_name", "country", "language"} {
+		if _, err := db.Exec("ALTER TABLE events ADD COLUMN " + col + " TEXT"); err != nil &&
+			!strings.Contains(err.Error(), "duplicate column") {
+			return nil, fmt.Errorf("migrate %s: %w", col, err)
+		}
+	}
+	// Index on steam_id created here, AFTER the column exists (the schema block above
+	// runs before the migration, so it can't reference steam_id on a pre-existing DB).
+	if _, err := db.Exec("CREATE INDEX IF NOT EXISTS idx_events_steam ON events(steam_id)"); err != nil {
+		return nil, fmt.Errorf("index steam_id: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -143,12 +195,16 @@ type Event struct {
 }
 
 type EventsBatch struct {
-	InstallID  string  `json:"install_id"`
-	SessionID  string  `json:"session_id"`
-	AppVersion string  `json:"app_version"`
-	OS         string  `json:"os"`
-	GPU        string  `json:"gpu"`
-	Events     []Event `json:"events"`
+	InstallID   string  `json:"install_id"`
+	SessionID   string  `json:"session_id"`
+	AppVersion  string  `json:"app_version"`
+	OS          string  `json:"os"`
+	GPU         string  `json:"gpu"`
+	SteamID     string  `json:"steam_id"`
+	PersonaName string  `json:"persona_name"`
+	Country     string  `json:"country"`
+	Language    string  `json:"language"`
+	Events      []Event `json:"events"`
 }
 
 type Crash struct {
@@ -187,8 +243,8 @@ func (s *Store) insertEvents(ctx context.Context, b EventsBatch, receivedAt int6
 	}
 	defer tx.Rollback()
 	stmt, err := tx.PrepareContext(ctx, `INSERT INTO events
-        (received_at, client_ts, install_id, session_id, app_version, os, gpu, event_type, payload)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        (received_at, client_ts, install_id, session_id, app_version, os, gpu, steam_id, persona_name, country, language, event_type, payload)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return 0, err
 	}
@@ -201,6 +257,7 @@ func (s *Store) insertEvents(ctx context.Context, b EventsBatch, receivedAt int6
 		}
 		if _, err := stmt.ExecContext(ctx,
 			receivedAt, e.ClientTS, b.InstallID, b.SessionID, b.AppVersion, b.OS, b.GPU,
+			b.SteamID, b.PersonaName, b.Country, b.Language,
 			e.EventType, payload); err != nil {
 			return n, err
 		}
@@ -504,6 +561,10 @@ func main() {
 	mux.HandleFunc("/v1/events", s.withRateLimit(s.withAuth(s.ingestEvents)))
 	mux.HandleFunc("/v1/crash", s.withRateLimit(s.withAuth(s.ingestCrash)))
 	mux.HandleFunc("/v1/bugreport", s.withRateLimit(s.withAuth(s.ingestBugReport)))
+	mux.HandleFunc("/v1/leaderboard/", s.withCORS(s.withRateLimit(s.leaderboard)))
+	mux.HandleFunc("/v1/leaderboard", s.withCORS(s.withRateLimit(s.leaderboard)))
+	mux.HandleFunc("/v1/manrocket/levels/", s.withCORS(s.withRateLimit(s.manrocketLevels)))
+	mux.HandleFunc("/v1/manrocket/levels", s.withCORS(s.withRateLimit(s.manrocketLevels)))
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

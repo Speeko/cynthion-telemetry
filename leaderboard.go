@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"regexp"
@@ -212,7 +214,7 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (st *Store) queryLeaderboard(game, mode string, level, limit int) ([]map[string]any, error) {
-	q := `SELECT name, time_ms, level, received_at, app_version
+	q := `SELECT name, time_ms, level, received_at, app_version, COALESCE(install_id, '')
 	      FROM leaderboard WHERE game=? AND mode=?`
 	args := []any{game, mode}
 	if mode == "level" {
@@ -229,9 +231,9 @@ func (st *Store) queryLeaderboard(game, mode string, level, limit int) ([]map[st
 	out := []map[string]any{}
 	rank := 1
 	for rs.Next() {
-		var name, ver string
+		var name, ver, install string
 		var timeMS, lvl, received int64
-		if err := rs.Scan(&name, &timeMS, &lvl, &received, &ver); err != nil {
+		if err := rs.Scan(&name, &timeMS, &lvl, &received, &ver, &install); err != nil {
 			return nil, err
 		}
 		out = append(out, map[string]any{
@@ -241,8 +243,18 @@ func (st *Store) queryLeaderboard(game, mode string, level, limit int) ([]map[st
 			"level":       lvl,
 			"received_at": received,
 			"app_version": ver,
+			"tag":         installTag(install),
 		})
 		rank++
 	}
 	return out, rs.Err()
+}
+
+// installTag: a short stable tag per install so same-named pilots can be told apart (never the id).
+func installTag(install string) string {
+	if install == "" {
+		return ""
+	}
+	h := sha1.Sum([]byte("manrocket-tag:" + install))
+	return hex.EncodeToString(h[:])[:4]
 }

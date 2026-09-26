@@ -37,7 +37,15 @@ func (s *Store) ensureNamesSchema() error {
 func normName(clean string) string { return strings.ToLower(clean) }
 
 // manrocketNameOwner returns the install that owns a (cleaned) name, or "" when it's free / "anon".
+// manrocketNamesUnique: Director 09-26 dropped name uniqueness (same player on two devices got
+// "taken" by their own name). With it off every name reads as free and the leaderboard tells
+// same-named pilots apart by a short install tag instead.
+const manrocketNamesUnique = false
+
 func (s *Store) manrocketNameOwner(clean string) (string, error) {
+	if !manrocketNamesUnique {
+		return "", nil
+	}
 	norm := normName(clean)
 	if norm == "anon" {
 		return "", nil

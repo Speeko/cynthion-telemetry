@@ -45,3 +45,14 @@ func TestGameTag(t *testing.T) {
 		t.Error("manrocket tags must not change")
 	}
 }
+
+func TestScoreGameModes(t *testing.T) {
+	for _, g := range []string{"launchlaser", "launchlaser1"} {
+		if !allowedLeaderboardGames[g] || !validLeaderboardMode(g, "score") || validLeaderboardMode(g, "level") {
+			t.Errorf("%s should allow only mode=score", g)
+		}
+	}
+	if validLeaderboardMode("manrocket", "score") {
+		t.Error("manrocket has no score board")
+	}
+}

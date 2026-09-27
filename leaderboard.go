@@ -16,8 +16,9 @@ import (
 // allowlisted + rate-limited; reads are public for cynthiongame.com pages.
 
 var allowedLeaderboardGames = map[string]bool{
-	"manrocket":   true,
-	"launchlaser": true,
+	"manrocket":    true,
+	"launchlaser":  true,
+	"launchlaser1": true,
 }
 
 var nameCleaner = regexp.MustCompile(`[^a-zA-Z0-9 _.\-]`)
@@ -201,7 +202,7 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
 	if mode == "" {
 		mode = "full_run"
-		if game == launchLaserGame {
+		if scoreGames[game] {
 			mode = "score"
 		}
 	}
@@ -210,7 +211,7 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if mode == "score" {
-		s.launchLaserGet(w, r)
+		s.launchLaserGet(w, r, game)
 		return
 	}
 	limit := 20
@@ -261,7 +262,7 @@ func (s *server) leaderboardGet(w http.ResponseWriter, r *http.Request) {
 // validLeaderboardMode: ManRocket has full_run / level / course (community courses); Launch Laser 2
 // has only score (highest wins).
 func validLeaderboardMode(game, mode string) bool {
-	if game == launchLaserGame {
+	if scoreGames[game] {
 		return mode == "score"
 	}
 	switch mode {

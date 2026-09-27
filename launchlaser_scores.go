@@ -23,6 +23,13 @@ const (
 	launchLaserGame     = "launchlaser"
 )
 
+// scoreGames: the high-score (mode=score) boards. "launchlaser" is Launch Laser 2 (Godot);
+// "launchlaser1" is the original Unity Launch Laser, revived as 1.19 — separate board, different scoring.
+var scoreGames = map[string]bool{
+	launchLaserGame: true,
+	"launchlaser1":  true,
+}
+
 // ensureLeaderboardScoreColumn: like the course column — CREATE TABLE IF NOT EXISTS never adds columns.
 func (st *Store) ensureLeaderboardScoreColumn() error {
 	if _, err := st.db.Exec(`ALTER TABLE leaderboard ADD COLUMN score INTEGER NOT NULL DEFAULT 0`); err != nil &&
@@ -66,7 +73,7 @@ func (s *server) launchLaserPost(w http.ResponseWriter, in leaderboardSubmit) {
 	res, err := s.store.db.Exec(
 		`INSERT INTO leaderboard (received_at, game, mode, level, course, time_ms, score, name, install_id, app_version)
 		 VALUES (?, ?, 'score', 0, '', ?, ?, ?, ?, ?)`,
-		time.Now().UnixMilli(), launchLaserGame, runMS, in.Score, name, install, strings.TrimSpace(in.AppVersion),
+		time.Now().UnixMilli(), in.Game, runMS, in.Score, name, install, strings.TrimSpace(in.AppVersion),
 	)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
@@ -89,7 +96,7 @@ func periodStart(period string, now time.Time) int64 {
 	return 0
 }
 
-func (s *server) launchLaserGet(w http.ResponseWriter, r *http.Request) {
+func (s *server) launchLaserGet(w http.ResponseWriter, r *http.Request, game string) {
 	period := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("period")))
 	if period != "day" && period != "week" {
 		period = "all"
@@ -101,21 +108,21 @@ func (s *server) launchLaserGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	since := periodStart(period, time.Now())
-	rows, err := s.store.queryScoreBoard(launchLaserGame, since, limit)
+	rows, err := s.store.queryScoreBoard(game, since, limit)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
 	var you any
 	if install := strings.TrimSpace(r.URL.Query().Get("install_id")); install != "" && len(install) <= 64 {
-		if rank, best, ok, err := s.store.scoreRank(launchLaserGame, since, install); err == nil && ok {
+		if rank, best, ok, err := s.store.scoreRank(game, since, install); err == nil && ok {
 			you = map[string]any{"rank": rank, "score": best}
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"ok":      true,
-		"game":    launchLaserGame,
+		"game":    game,
 		"mode":    "score",
 		"period":  period,
 		"entries": rows,

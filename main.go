@@ -1,9 +1,18 @@
-// Cynthion telemetry ingest endpoint.
+// Runed Poodle telemetry: one ingest process hosting multiple games.
 //
-// Two write endpoints (POST /v1/events, POST /v1/crash) + a /health probe.
+// Cynthion stays on POST /v1/events, POST /v1/crash, POST /v1/bugreport
+// (INGEST_API_KEY, tables events/crashes/bugreports). Those paths are not
+// renamed here; that is a later migration.
+// ManRocket is game-scoped on POST /v1/manrocket/events, /v1/manrocket/crash,
+// and /v1/manrocket/bugreport (MANROCKET_INGEST_API_KEY, manrocket_* tables).
+// See manrocket_ingest.go. Public ManRocket community routes are separate.
+// Plus a /health probe.
 // SQLite storage (modernc.org/sqlite — pure Go, no CGO).
-// Auth: X-API-Key header against INGEST_API_KEY env var.
+// Auth: X-API-Key header.
 // Rate limit: per-IP token bucket via golang.org/x/time/rate.
+//
+// The binary, Docker image, and public host are still cynthion-telemetry /
+// api.cynthiongame.com.
 //
 // Designed for the cynthion-au droplet:
 //   - Listens on :8090 inside Docker, port mapped to 127.0.0.1:8090 on host
@@ -40,22 +49,31 @@ const (
 )
 
 type Config struct {
-	Listen string
-	APIKey string
-	DBPath string
+	Listen          string
+	APIKey          string
+	ManRocketAPIKey string
+	DBPath          string
 }
 
 func loadConfig() Config {
 	c := Config{
-		Listen: envOr("LISTEN_ADDR", ":8090"),
-		APIKey: os.Getenv("INGEST_API_KEY"),
-		DBPath: envOr("DB_PATH", "/data/events.db"),
+		Listen:          envOr("LISTEN_ADDR", ":8090"),
+		APIKey:          os.Getenv("INGEST_API_KEY"),
+		ManRocketAPIKey: os.Getenv("MANROCKET_INGEST_API_KEY"),
+		DBPath:          envOr("DB_PATH", "/data/events.db"),
 	}
 	if c.APIKey == "" {
 		log.Fatal("INGEST_API_KEY env var is required")
 	}
 	if len(c.APIKey) < 24 {
 		log.Fatal("INGEST_API_KEY must be at least 24 characters")
+	}
+	// ManRocket ingest is optional at boot so a deploy without the new key
+	// cannot take down Cynthion. Those routes return 401 until it is set.
+	if len(c.ManRocketAPIKey) < 24 {
+		log.Print("MANROCKET_INGEST_API_KEY unset or shorter than 24 characters; POST /v1/manrocket/events, /v1/manrocket/crash, and /v1/manrocket/bugreport will return 401")
+	} else {
+		log.Print("manrocket ingest auth enabled (MANROCKET_INGEST_API_KEY)")
 	}
 	return c
 }
@@ -201,6 +219,9 @@ func openStore(path string) (*Store, error) {
 	}
 	if err := st.ensureFeedbackSchema(); err != nil {
 		return nil, fmt.Errorf("feedback schema: %w", err)
+	}
+	if err := st.ensureManRocketIngestSchema(); err != nil {
+		return nil, fmt.Errorf("manrocket ingest schema: %w", err)
 	}
 	return st, nil
 }
@@ -396,13 +417,16 @@ func (w *statusWriter) WriteHeader(s int) { w.status = s; w.ResponseWriter.Write
 // ------------- handlers -------------
 
 type server struct {
-	cfg          Config
-	store        *Store
-	limiter      *ipLimiter
-	bugReportDir string
+	cfg             Config
+	store           *Store
+	limiter         *ipLimiter
+	bugReportDir    string
+	manrocketBugDir string
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
+	// Service id in the probe body stays "cynthion-telemetry". The product
+	// name is Runed Poodle; the public hostname is still api.cynthiongame.com.
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true,"service":"cynthion-telemetry"}`))
 }
@@ -553,6 +577,28 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	json.NewEncoder(w).Encode(body)
 }
 
+func (s *server) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", s.health)
+	mux.HandleFunc("/v1/events", s.withRateLimit(s.withAuth(s.ingestEvents)))
+	mux.HandleFunc("/v1/crash", s.withRateLimit(s.withAuth(s.ingestCrash)))
+	mux.HandleFunc("/v1/bugreport", s.withRateLimit(s.withAuth(s.ingestBugReport)))
+	mux.HandleFunc("/v1/manrocket/events", s.withRateLimit(s.withManRocketAuth(s.ingestManRocketEvents)))
+	mux.HandleFunc("/v1/manrocket/crash", s.withRateLimit(s.withManRocketAuth(s.ingestManRocketCrash)))
+	mux.HandleFunc("/v1/manrocket/bugreport", s.withRateLimit(s.withManRocketAuth(s.ingestManRocketBugReport)))
+	mux.HandleFunc("/v1/leaderboard/", s.withCORS(s.withRateLimit(s.leaderboard)))
+	mux.HandleFunc("/v1/leaderboard", s.withCORS(s.withRateLimit(s.leaderboard)))
+	mux.HandleFunc("/v1/manrocket/levels/", s.withCORS(s.withRateLimit(s.manrocketLevels)))
+	mux.HandleFunc("/v1/manrocket/levels", s.withCORS(s.withRateLimit(s.manrocketLevels)))
+	mux.HandleFunc("/v1/manrocket/whiteboards/", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
+	mux.HandleFunc("/v1/manrocket/whiteboards", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
+	mux.HandleFunc("/v1/manrocket/phrases/", s.withCORS(s.manrocketPhrases)) // rate-limits itself (wavs looser)
+	mux.HandleFunc("/v1/manrocket/phrases", s.withCORS(s.manrocketPhrases))
+	mux.HandleFunc("/v1/manrocket/names/", s.withCORS(s.withRateLimit(s.manrocketNames)))
+	mux.HandleFunc("/v1/manrocket/feedback", s.withCORS(s.withRateLimit(s.manrocketFeedback)))
+	return s.withLog(mux)
+}
+
 // ------------- main -------------
 
 func main() {
@@ -567,33 +613,22 @@ func main() {
 	if err := os.MkdirAll(bugReportDir, 0o755); err != nil {
 		log.Fatalf("create bugreport dir: %v", err)
 	}
-
-	s := &server{
-		cfg:          cfg,
-		store:        store,
-		limiter:      newIPLimiter(2, 20), // 2 req/sec/IP sustained, burst 20
-		bugReportDir: bugReportDir,
+	manrocketBugDir := filepath.Join(filepath.Dir(cfg.DBPath), "manrocket_bugreports")
+	if err := os.MkdirAll(manrocketBugDir, 0o755); err != nil {
+		log.Fatalf("create manrocket bugreport dir: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.health)
-	mux.HandleFunc("/v1/events", s.withRateLimit(s.withAuth(s.ingestEvents)))
-	mux.HandleFunc("/v1/crash", s.withRateLimit(s.withAuth(s.ingestCrash)))
-	mux.HandleFunc("/v1/bugreport", s.withRateLimit(s.withAuth(s.ingestBugReport)))
-	mux.HandleFunc("/v1/leaderboard/", s.withCORS(s.withRateLimit(s.leaderboard)))
-	mux.HandleFunc("/v1/leaderboard", s.withCORS(s.withRateLimit(s.leaderboard)))
-	mux.HandleFunc("/v1/manrocket/levels/", s.withCORS(s.withRateLimit(s.manrocketLevels)))
-	mux.HandleFunc("/v1/manrocket/levels", s.withCORS(s.withRateLimit(s.manrocketLevels)))
-	mux.HandleFunc("/v1/manrocket/whiteboards/", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
-	mux.HandleFunc("/v1/manrocket/whiteboards", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
-	mux.HandleFunc("/v1/manrocket/phrases/", s.withCORS(s.manrocketPhrases)) // rate-limits itself (wavs looser)
-	mux.HandleFunc("/v1/manrocket/phrases", s.withCORS(s.manrocketPhrases))
-	mux.HandleFunc("/v1/manrocket/names/", s.withCORS(s.withRateLimit(s.manrocketNames)))
-	mux.HandleFunc("/v1/manrocket/feedback", s.withCORS(s.withRateLimit(s.manrocketFeedback)))
+	s := &server{
+		cfg:             cfg,
+		store:           store,
+		limiter:         newIPLimiter(2, 20), // 2 req/sec/IP sustained, burst 20
+		bugReportDir:    bugReportDir,
+		manrocketBugDir: manrocketBugDir,
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           s.withLog(mux),
+		Handler:           s.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       120 * time.Second, // headroom for multipart bug-report zip uploads (up to 32 MB)
 		WriteTimeout:      120 * time.Second,
@@ -602,6 +637,7 @@ func main() {
 	}
 
 	go func() {
+		// Log line keeps the historical process name. The product is Runed Poodle.
 		log.Printf("cynthion-telemetry listening on %s", cfg.Listen)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)

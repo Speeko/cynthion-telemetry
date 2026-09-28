@@ -1,23 +1,33 @@
-# cynthion-telemetry
+# Runed Poodle telemetry
 
-Tiny Go HTTP ingest endpoint for Cynthion game telemetry (events + crash reports). SQLite storage, single binary, behind Caddy on `api.cynthiongame.com`.
+Runed Poodle telemetry is the shared ingest for multiple games. This process currently hosts **Cynthion** and **ManRocket** in one SQLite database, behind Caddy on `api.cynthiongame.com`. The public hostname is unchanged. The repo, Docker image, container, and droplet directory are still named `cynthion-telemetry`.
+
+Cynthion stays on the existing unprefixed routes (`POST /v1/events`, `/v1/crash`, `/v1/bugreport`) and tables (`events`, `crashes`, `bugreports`). Renaming those paths is a later migration.
+
+ManRocket is game-scoped on `/v1/manrocket/events`, `/v1/manrocket/crash`, and `/v1/manrocket/bugreport`. It uses `MANROCKET_INGEST_API_KEY` and its own tables (`manrocket_events`, `manrocket_crashes`, `manrocket_bugreports`). Request shapes match Cynthion ingest.
 
 ## Layout
 
-- `main.go` — everything (~300 LOC)
+- `main.go` — Cynthion ingest, store, routing
+- `manrocket_ingest.go` — ManRocket ingest under Runed Poodle (own tables + `MANROCKET_INGEST_API_KEY`)
 - `Dockerfile` — multi-stage build, runs non-root on Alpine
 - `docker-compose.yml` — bound to `127.0.0.1:8090` on host (Caddy proxies via `host.docker.internal:8090`)
-- `data/` — SQLite at `./data/events.db` (WAL mode)
-- `.env` — `INGEST_API_KEY` (gitignored)
+- `data/` — SQLite at `./data/events.db` (WAL mode); bug-report zips in `data/bugreports/` and `data/manrocket_bugreports/`
+- `.env` — `INGEST_API_KEY`, `MANROCKET_INGEST_API_KEY`, `MANROCKET_ADMIN_KEY` (gitignored)
 
 ## Endpoints
+
+Cynthion uses the unprefixed `/v1/events`, `/v1/crash`, and `/v1/bugreport` paths on `api.cynthiongame.com`. ManRocket uses the `/v1/manrocket/…` routes on that same host.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | none | liveness probe |
-| POST | `/v1/events` | `X-API-Key` | batched gameplay events |
-| POST | `/v1/crash` | `X-API-Key` | crash + log upload |
-| POST | `/v1/bugreport` | `X-API-Key` | user-submitted bug report (zip upload) |
+| POST | `/v1/events` | `X-API-Key` (`INGEST_API_KEY`) | batched Cynthion gameplay events |
+| POST | `/v1/crash` | `X-API-Key` (`INGEST_API_KEY`) | Cynthion crash + log upload |
+| POST | `/v1/bugreport` | `X-API-Key` (`INGEST_API_KEY`) | Cynthion bug report (zip upload) |
+| POST | `/v1/manrocket/events` | `X-API-Key` (`MANROCKET_INGEST_API_KEY`) | batched ManRocket gameplay events |
+| POST | `/v1/manrocket/crash` | `X-API-Key` (`MANROCKET_INGEST_API_KEY`) | ManRocket crash + log upload |
+| POST | `/v1/manrocket/bugreport` | `X-API-Key` (`MANROCKET_INGEST_API_KEY`) | ManRocket bug report (zip upload) |
 
 ### POST /v1/events
 
@@ -75,6 +85,45 @@ Response: `{"ok":true,"id":<rowid>}`
 The zip is written to `data/bugreports/<received_ms>_<install8>.zip`; a metadata row goes into the `bugreports` table (`archive_name` points at the file). Client sends this consent-independently — a manual bug report is an explicit user action.
 
 Response: `{"ok":true,"id":<rowid>,"archive":"<filename>.zip"}`
+
+## ManRocket ingest (Runed Poodle)
+
+Source: `manrocket_ingest.go`. This is the ManRocket game under Runed Poodle telemetry, on the manrocket-prefixed routes. Same JSON / multipart shapes as the Cynthion routes above, including the optional batch fields `steam_id`, `persona_name`, `country`, and `language`. Auth header is `X-API-Key`, checked against **`MANROCKET_INGEST_API_KEY`**. A missing, wrong, or shorter-than-24-character key returns `401 unauthorized` and writes nothing. The process still boots if the var is unset, so Cynthion ingest keeps working; these three routes stay closed until Homelab sets the key and recreates the container.
+
+Rows go to `manrocket_events`, `manrocket_crashes`, and `manrocket_bugreports`. Zips go to `data/manrocket_bugreports/<received_ms>_<install8>.zip`. Nothing is inserted into `events`, `crashes`, or `bugreports`, and nothing is written under `data/bugreports/`.
+
+Public ManRocket community routes (`/v1/manrocket/levels`, whiteboards, phrases, names, feedback, and `/v1/leaderboard`) are unchanged and do not take this key.
+
+```bash
+curl -sS -X POST http://127.0.0.1:8090/v1/manrocket/events \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: YOUR_MANROCKET_INGEST_API_KEY' \
+  -d '{"install_id":"00000000-0000-4000-8000-000000000000","session_id":"00000000-0000-4000-8000-000000000001","app_version":"0.1.0","os":"Windows 10","gpu":"NVIDIA RTX 3080","steam_id":"","persona_name":"","country":"US","language":"english","events":[{"client_ts":1779515374000,"event_type":"session_start","payload":{}}]}'
+```
+
+```bash
+curl -sS -X POST http://127.0.0.1:8090/v1/manrocket/crash \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: YOUR_MANROCKET_INGEST_API_KEY' \
+  -d '{"install_id":"00000000-0000-4000-8000-000000000000","session_id":"00000000-0000-4000-8000-000000000001","app_version":"0.1.0","os":"Linux","gpu":"NVIDIA RTX 3080 (Vulkan)","error_summary":"SIGSEGV","boot_log":"","player_log":"","payload":{}}'
+```
+
+```bash
+curl -sS -X POST http://127.0.0.1:8090/v1/manrocket/bugreport \
+  -H 'X-API-Key: YOUR_MANROCKET_INGEST_API_KEY' \
+  -F 'install_id=00000000-0000-4000-8000-000000000000' \
+  -F 'session_id=00000000-0000-4000-8000-000000000001' \
+  -F 'app_version=0.1.0' \
+  -F 'os=Windows 10' \
+  -F 'gpu=NVIDIA RTX 3080' \
+  -F 'category=gameplay' \
+  -F 'severity=high' \
+  -F 'description=rocket stuck on the pad' \
+  -F 'expected_behavior=liftoff' \
+  -F 'archive=@report.zip'
+```
+
+Responses match Cynthion: events `{"ok":true,"received":N}`, crash `{"ok":true,"id":<rowid>}`, bug report `{"ok":true,"id":<rowid>,"archive":"<filename>.zip"}`. Limits match too (4 MB events/crash, 32 MB bug report, 200 events per batch).
 
 ## Leaderboard
 
@@ -146,9 +195,9 @@ Delete: `sqlite3 data/events.db "DELETE FROM manrocket_feedback WHERE id=?"`.
 
 ## Limits
 
-- 4 MB max body (`/v1/events`, `/v1/crash`)
-- 32 MB max body (`/v1/bugreport` — screenshot + save snapshot)
-- 200 events per batch
+- 4 MB max body (`/v1/events`, `/v1/crash`, `/v1/manrocket/events`, `/v1/manrocket/crash`)
+- 32 MB max body (`/v1/bugreport`, `/v1/manrocket/bugreport` — screenshot + save snapshot)
+- 200 events per batch (both event routes)
 - 2 req/sec/IP sustained, burst 20 (rate limiter)
 
 ## Deploy
@@ -165,7 +214,44 @@ scp *.go go.mod go.sum docker-compose.yml Dockerfile README.md root@170.64.160.2
 ssh root@170.64.160.249 'docker load < /tmp/img.tar.gz && rm /tmp/img.tar.gz && cd /srv/cynthion-telemetry && docker compose up -d && docker logs --tail 20 cynthion-telemetry'
 ```
 
-`.env` on the droplet holds `INGEST_API_KEY` and `MANROCKET_ADMIN_KEY` (never commit it). `data/` is the live DB — never overwrite.
+`.env` on the droplet holds `INGEST_API_KEY`, `MANROCKET_INGEST_API_KEY`, and `MANROCKET_ADMIN_KEY` (never commit it). `data/` is the live DB — never overwrite.
+
+### Homelab: set `MANROCKET_INGEST_API_KEY` after merge
+
+Homelab owns the deploy. Do not build on the droplet. Ship the new image with the commands above first (or set the key, then ship — `docker compose up -d` at the end of that flow starts the new binary with `.env`).
+
+Do not commit the value. Generate a new key; do not copy `INGEST_API_KEY`.
+
+The new image can boot before the var exists: Cynthion ingest keeps using `INGEST_API_KEY`, and `/v1/manrocket/events`, `/v1/manrocket/crash`, and `/v1/manrocket/bugreport` return 401 until the key is present in the running container. Community routes are unaffected. An already-running container will not see an `.env` edit until it is recreated (brief restart, image is not rebuilt, `data/` is not touched).
+
+```bash
+ssh root@170.64.160.249 'bash -s' <<'EOF'
+set -euo pipefail
+cd /srv/cynthion-telemetry
+umask 077
+# Keep INGEST_API_KEY. Append one new line if it is not already there.
+# A missing trailing newline on .env would glue this onto the previous line.
+if [ -s .env ] && [ -n "$(tail -c1 .env)" ]; then
+  echo >> .env
+fi
+if ! grep -q '^MANROCKET_INGEST_API_KEY=' .env; then
+  echo "MANROCKET_INGEST_API_KEY=$(openssl rand -hex 32)" >> .env
+fi
+docker compose up -d --force-recreate
+docker logs --tail 30 cynthion-telemetry
+EOF
+```
+
+A healthy boot logs `manrocket ingest auth enabled (MANROCKET_INGEST_API_KEY)`. `MANROCKET_INGEST_API_KEY unset or shorter than 24 characters` means the var did not reach the container. Then smoke-check on the droplet. Replace the placeholder with the value just written to `.env` (do not paste that value into git or chat). An empty `events` array returns 200 and inserts no row:
+
+```bash
+ssh root@170.64.160.249 "curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8090/v1/manrocket/events \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: YOUR_MANROCKET_INGEST_API_KEY' \
+  -d '{\"install_id\":\"smoke\",\"events\":[]}'"
+```
+
+`200` means the key matched. `401` means the header does not match the env var in the running container.
 
 ## Querying the data
 
@@ -173,8 +259,12 @@ ssh root@170.64.160.249 'docker load < /tmp/img.tar.gz && rm /tmp/img.tar.gz && 
 ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT event_type, COUNT(*) FROM events GROUP BY event_type"'
 ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT received_at, install_id, error_summary FROM crashes ORDER BY received_at DESC LIMIT 10"'
 ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT received_at, install_id, category, severity, description, archive_name FROM bugreports ORDER BY received_at DESC LIMIT 10"'
+ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT event_type, COUNT(*) FROM manrocket_events GROUP BY event_type"'
+ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT received_at, install_id, error_summary FROM manrocket_crashes ORDER BY received_at DESC LIMIT 10"'
+ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "SELECT received_at, install_id, category, severity, description, archive_name FROM manrocket_bugreports ORDER BY received_at DESC LIMIT 10"'
 # Pull a bug-report zip down to inspect locally:
 scp root@170.64.160.249:/srv/cynthion-telemetry/data/bugreports/<archive_name> /tmp/
+scp root@170.64.160.249:/srv/cynthion-telemetry/data/manrocket_bugreports/<archive_name> /tmp/
 ```
 
 ## Privacy notes
@@ -188,4 +278,10 @@ scp root@170.64.160.249:/srv/cynthion-telemetry/data/bugreports/<archive_name> /
 
 ```bash
 ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "DELETE FROM events WHERE install_id=?; DELETE FROM crashes WHERE install_id=?" <UUID> <UUID>'
+```
+
+ManRocket rows live in their own tables (and zips under `data/manrocket_bugreports/`, named with the first 8 characters of `install_id`):
+
+```bash
+ssh root@170.64.160.249 "sqlite3 /srv/cynthion-telemetry/data/events.db \"DELETE FROM manrocket_events WHERE install_id='<UUID>'; DELETE FROM manrocket_crashes WHERE install_id='<UUID>'; DELETE FROM manrocket_bugreports WHERE install_id='<UUID>';\""
 ```

@@ -4,6 +4,9 @@ services:
     image: cynthion-telemetry:latest
     container_name: cynthion-telemetry
     restart: unless-stopped
+    # .env supplies INGEST_API_KEY, MANROCKET_INGEST_API_KEY, and MANROCKET_ADMIN_KEY.
+    # Do not also list MANROCKET_INGEST_API_KEY under environment: — an empty
+    # compose interpolation would override the env_file value.
     env_file: .env
     environment:
       LISTEN_ADDR: ":8090"
@@ -12,7 +15,8 @@ services:
       - ./data:/data
     ports:
       # Loopback for local curls; public traffic is Caddy on cynthion-net
-      # (api.cynthiongame.com → cynthion-telemetry:8090).
+      # (api.cynthiongame.com → cynthion-telemetry:8090). Hostname unchanged.
+      # This container is Runed Poodle telemetry (Cynthion + ManRocket).
       - "127.0.0.1:8090:8090"
     networks:
       - default

@@ -409,14 +409,14 @@ func (s *server) mrCreateComment(w http.ResponseWriter, r *http.Request, levelID
 	}
 	commentRef := sql.NullInt64{Int64: id, Valid: true}
 	if owner != install {
-		if err := insertManRocketNotification(tx, owner, notifCommentOnLevel, install, levelID, commentRef, sql.NullInt64{}, now); err != nil {
+		if err := insertManRocketNotification(tx, owner, notifCommentOnLevel, install, levelID, commentRef, now); err != nil {
 			log.Printf("create comment failed: %v", err)
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
 	}
 	if reply.Valid && parentOwner != install {
-		if err := insertManRocketNotification(tx, parentOwner, notifReplyToYou, install, levelID, commentRef, sql.NullInt64{}, now); err != nil {
+		if err := insertManRocketNotification(tx, parentOwner, notifReplyToYou, install, levelID, commentRef, now); err != nil {
 			log.Printf("create comment failed: %v", err)
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return

@@ -1,14 +1,15 @@
 package main
 
-// ManRocket notification inbox, plus the play-count ledger a future play
-// route should call. Public (no analytics API key), keyed by install_id,
-// same trust model as level votes.
+// ManRocket notification inbox. Public (no analytics API key), keyed by
+// install_id, same trust model as level votes.
 //
 //	GET  /v1/manrocket/notifications?install_id=[&limit=][&offset=][&unread=1]
 //	POST /v1/manrocket/notifications/read   {install_id, ids[]|all:true}
 //
-// Rows are written when a comment, reply, or new +1 vote lands, and when
-// NoteManRocketLevelPlay crosses 1, 10, 100, or 500 plays for the first time.
+// Rows live in manrocket_level_notifications, the table the play route
+// already fills with kind=play_milestone. This file adds inbox columns
+// (actor, comment, read_at) and writes comment, reply, and vote rows into
+// the same table. Play milestone uniqueness is unchanged.
 
 import (
 	"database/sql"
@@ -23,17 +24,14 @@ const (
 	notifCommentOnLevel = "comment_on_your_level"
 	notifReplyToYou     = "reply_to_you"
 	notifVoteOnLevel    = "vote_on_your_level"
-	notifPlayMilestone  = "play_milestone"
+	notifPlayMilestone  = mrPlayMilestoneKind
 
 	notifListDefault = 40
 	notifListMax     = 100
 	notifReadMaxIDs  = 200
 )
 
-// playMilestones are the play_count thresholds that emit play_milestone once.
-var playMilestones = []int{1, 10, 100, 500}
-
-const manrocketSocialSchema = `
+const manrocketCommentSchema = `
 CREATE TABLE IF NOT EXISTS manrocket_level_comments (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	level_id TEXT NOT NULL,
@@ -50,40 +48,92 @@ CREATE INDEX IF NOT EXISTS idx_mr_comments_level ON manrocket_level_comments(lev
 CREATE INDEX IF NOT EXISTS idx_mr_comments_reply ON manrocket_level_comments(level_id, reply_to, created_at);
 CREATE INDEX IF NOT EXISTS idx_mr_comments_install ON manrocket_level_comments(install_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_mr_comments_ip ON manrocket_level_comments(ip, created_at);
-
-CREATE TABLE IF NOT EXISTS manrocket_notifications (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	recipient_install_id TEXT NOT NULL,
-	type TEXT NOT NULL,
-	actor_install_id TEXT NOT NULL,
-	level_id TEXT,
-	comment_id INTEGER,
-	milestone INTEGER,
-	created_at INTEGER NOT NULL,
-	read_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_mr_notif_inbox ON manrocket_notifications(recipient_install_id, created_at DESC, id DESC);
--- One vote notification per (owner, voter, level). Repeat +1s do not stack.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_mr_notif_vote_once
-	ON manrocket_notifications(recipient_install_id, actor_install_id, level_id)
-	WHERE type = 'vote_on_your_level';
-
-CREATE TABLE IF NOT EXISTS manrocket_level_play_counts (
-	level_id TEXT PRIMARY KEY,
-	play_count INTEGER NOT NULL DEFAULT 0,
-	updated_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS manrocket_level_play_milestones (
-	level_id TEXT NOT NULL,
-	milestone INTEGER NOT NULL,
-	reached_at INTEGER NOT NULL,
-	PRIMARY KEY (level_id, milestone)
-);
 `
 
 func (s *Store) ensureManRocketSocialSchema() error {
-	_, err := s.db.Exec(manrocketSocialSchema)
+	if _, err := s.db.Exec(manrocketCommentSchema); err != nil {
+		return err
+	}
+	// Play schema creates manrocket_level_notifications. Extend it; do not
+	// replace the table the play route inserts into.
+	if err := s.ensureNotificationInboxColumns(); err != nil {
+		return err
+	}
+	if err := s.relaxPlayNotificationUniqueness(); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mr_notif_play_once
+		ON manrocket_level_notifications(level_id, kind, threshold)
+		WHERE kind = 'play_milestone'`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mr_notif_vote_once
+		ON manrocket_level_notifications(level_id, install_id, actor_install_id)
+		WHERE kind = 'vote_on_your_level'`); err != nil {
+		return err
+	}
+	_, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mr_notif_inbox
+		ON manrocket_level_notifications(install_id, created_at DESC, id DESC)`)
 	return err
+}
+
+func (st *Store) ensureNotificationInboxColumns() error {
+	alters := []string{
+		`ALTER TABLE manrocket_level_notifications ADD COLUMN actor_install_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE manrocket_level_notifications ADD COLUMN comment_id INTEGER`,
+		`ALTER TABLE manrocket_level_notifications ADD COLUMN read_at INTEGER`,
+	}
+	for _, q := range alters {
+		if _, err := st.db.Exec(q); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return err
+		}
+	}
+	return nil
+}
+
+// relaxPlayNotificationUniqueness drops the table-level UNIQUE(level_id, kind, threshold)
+// copied from the play stub. That constraint also blocked a second comment or vote
+// on the same level. Play rows stay unique via idx_mr_notif_play_once.
+func (st *Store) relaxPlayNotificationUniqueness() error {
+	var ddl string
+	if err := st.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='manrocket_level_notifications'`).Scan(&ddl); err != nil {
+		return err
+	}
+	if !strings.Contains(strings.ToUpper(ddl), "UNIQUE") {
+		return nil
+	}
+	tx, err := st.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`CREATE TABLE manrocket_level_notifications_next (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		level_id TEXT NOT NULL,
+		install_id TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		threshold INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		actor_install_id TEXT NOT NULL DEFAULT '',
+		comment_id INTEGER,
+		read_at INTEGER
+	)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO manrocket_level_notifications_next
+		(id, level_id, install_id, kind, threshold, created_at, actor_install_id, comment_id, read_at)
+		SELECT id, level_id, install_id, kind, threshold, created_at,
+		       COALESCE(actor_install_id, ''), comment_id, read_at
+		FROM manrocket_level_notifications`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE manrocket_level_notifications`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE manrocket_level_notifications_next RENAME TO manrocket_level_notifications`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *server) manrocketNotifications(w http.ResponseWriter, r *http.Request) {
@@ -117,9 +167,9 @@ func (s *server) mrListNotifications(w http.ResponseWriter, r *http.Request) {
 		unreadParam = 1
 	}
 	rows, err := s.store.db.Query(
-		`SELECT id, type, actor_install_id, level_id, comment_id, milestone, created_at, read_at
-		 FROM manrocket_notifications
-		 WHERE recipient_install_id=? AND (read_at IS NULL OR ? = 0)
+		`SELECT id, kind, actor_install_id, level_id, comment_id, threshold, created_at, read_at
+		 FROM manrocket_level_notifications
+		 WHERE install_id=? AND (read_at IS NULL OR ? = 0)
 		 ORDER BY created_at DESC, id DESC
 		 LIMIT ? OFFSET ?`,
 		install, unreadParam, limit, offset,
@@ -132,16 +182,15 @@ func (s *server) mrListNotifications(w http.ResponseWriter, r *http.Request) {
 	defer rows.Close()
 	out := []map[string]any{}
 	for rows.Next() {
-		var id, created int64
-		var typ, actor string
-		var level sql.NullString
-		var commentID, milestone, readAt sql.NullInt64
-		if err := rows.Scan(&id, &typ, &actor, &level, &commentID, &milestone, &created, &readAt); err != nil {
+		var id, threshold, created int64
+		var kind, actor, levelID string
+		var commentID, readAt sql.NullInt64
+		if err := rows.Scan(&id, &kind, &actor, &levelID, &commentID, &threshold, &created, &readAt); err != nil {
 			log.Printf("scan notification failed: %v", err)
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
-		out = append(out, notificationJSON(id, typ, actor, level, commentID, milestone, readAt, created))
+		out = append(out, notificationJSON(id, kind, actor, levelID, commentID, threshold, created, readAt))
 	}
 	if err := rows.Err(); err != nil {
 		log.Printf("list notifications failed: %v", err)
@@ -151,24 +200,25 @@ func (s *server) mrListNotifications(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "notifications": out})
 }
 
-func notificationJSON(id int64, typ, actor string, level sql.NullString, commentID, milestone, readAt sql.NullInt64, created int64) map[string]any {
-	var levelID, comment, mile, read any
-	if level.Valid {
-		levelID = level.String
+func notificationJSON(id int64, kind, actor, levelID string, commentID sql.NullInt64, threshold, created int64, readAt sql.NullInt64) map[string]any {
+	var actorV, comment, mile, read any
+	if actor != "" {
+		actorV = actor
 	}
 	if commentID.Valid {
 		comment = commentID.Int64
 	}
-	if milestone.Valid {
-		mile = milestone.Int64
+	if kind == mrPlayMilestoneKind {
+		mile = threshold
 	}
 	if readAt.Valid {
 		read = readAt.Int64
 	}
 	return map[string]any{
 		"id":               id,
-		"type":             typ,
-		"actor_install_id": actor,
+		"type":             kind,
+		"kind":             kind,
+		"actor_install_id": actorV,
 		"level_id":         levelID,
 		"comment_id":       comment,
 		"milestone":        mile,
@@ -207,7 +257,7 @@ func (s *server) mrReadNotifications(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if in.All {
 		res, execErr := s.store.db.Exec(
-			`UPDATE manrocket_notifications SET read_at=? WHERE recipient_install_id=? AND read_at IS NULL`,
+			`UPDATE manrocket_level_notifications SET read_at=? WHERE install_id=? AND read_at IS NULL`,
 			now, install,
 		)
 		if execErr != nil {
@@ -231,8 +281,8 @@ func (s *server) mrReadNotifications(w http.ResponseWriter, r *http.Request) {
 		defer tx.Rollback()
 		for _, id := range in.IDs {
 			res, execErr := tx.Exec(
-				`UPDATE manrocket_notifications SET read_at=?
-				 WHERE id=? AND recipient_install_id=? AND read_at IS NULL`,
+				`UPDATE manrocket_level_notifications SET read_at=?
+				 WHERE id=? AND install_id=? AND read_at IS NULL`,
 				now, id, install,
 			)
 			if execErr != nil {
@@ -262,18 +312,17 @@ func (s *server) mrReadNotifications(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": updated})
 }
 
-// insertManRocketNotification writes one inbox row on tx. commentID and
-// milestone are NULL when invalid. The caller decides whether a self-event
-// should be skipped; this helper writes whatever it is given.
-func insertManRocketNotification(tx *sql.Tx, recipient, typ, actor, levelID string, commentID, milestone sql.NullInt64, now int64) error {
+// insertManRocketNotification writes one inbox row on tx. threshold is 0 for
+// non-milestone kinds; play_milestone rows are inserted by recordPlayMilestones.
+func insertManRocketNotification(tx *sql.Tx, recipient, kind, actor, levelID string, commentID sql.NullInt64, now int64) error {
 	if recipient == "" {
 		return nil
 	}
 	_, err := tx.Exec(
-		`INSERT INTO manrocket_notifications
-		 (recipient_install_id, type, actor_install_id, level_id, comment_id, milestone, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		recipient, typ, actor, levelID, commentID, milestone, now,
+		`INSERT INTO manrocket_level_notifications
+		 (level_id, install_id, kind, threshold, created_at, actor_install_id, comment_id)
+		 VALUES (?, ?, ?, 0, ?, ?, ?)`,
+		levelID, recipient, kind, now, actor, commentID,
 	)
 	return err
 }
@@ -290,92 +339,14 @@ func (s *server) notifyVoteOnLevel(levelID, actor string) {
 		return
 	}
 	if _, err := s.store.db.Exec(
-		`INSERT OR IGNORE INTO manrocket_notifications
-		 (recipient_install_id, type, actor_install_id, level_id, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		owner, notifVoteOnLevel, actor, levelID, time.Now().UnixMilli(),
+		`INSERT INTO manrocket_level_notifications
+		 (level_id, install_id, kind, threshold, created_at, actor_install_id)
+		 VALUES (?, ?, ?, 0, ?, ?)
+		 ON CONFLICT(level_id, install_id, actor_install_id) WHERE kind = 'vote_on_your_level' DO NOTHING`,
+		levelID, owner, notifVoteOnLevel, time.Now().UnixMilli(), actor,
 	); err != nil {
 		log.Printf("vote notification failed: %v", err)
 	}
-}
-
-// NoteManRocketLevelPlay is the play-route hook. There is no public play
-// endpoint yet. Call this once per play: it increments
-// manrocket_level_play_counts and, the first time play_count reaches 1, 10,
-// 100, or 500, writes one play_milestone notification to the level owner.
-// actorInstallID is the player (stored on the row; may equal the owner).
-// now is unix milliseconds; <= 0 means time.Now.
-// Returns milestones newly crossed. sql.ErrNoRows if the level does not exist.
-func (st *Store) NoteManRocketLevelPlay(levelID, actorInstallID string, now int64) ([]int, error) {
-	levelID = strings.TrimSpace(levelID)
-	if levelID == "" || len(levelID) > 80 {
-		return nil, sql.ErrNoRows
-	}
-	actorInstallID = strings.TrimSpace(actorInstallID)
-	if len(actorInstallID) > 64 {
-		actorInstallID = actorInstallID[:64]
-	}
-	if now <= 0 {
-		now = time.Now().UnixMilli()
-	}
-	tx, err := st.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	var owner string
-	if err := tx.QueryRow(`SELECT install_id FROM manrocket_levels WHERE id=?`, levelID).Scan(&owner); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(
-		`INSERT INTO manrocket_level_play_counts (level_id, play_count, updated_at) VALUES (?, 1, ?)
-		 ON CONFLICT(level_id) DO UPDATE SET play_count = play_count + 1, updated_at = excluded.updated_at`,
-		levelID, now,
-	); err != nil {
-		return nil, err
-	}
-	var count int
-	if err := tx.QueryRow(`SELECT play_count FROM manrocket_level_play_counts WHERE level_id=?`, levelID).Scan(&count); err != nil {
-		return nil, err
-	}
-	var crossed []int
-	for _, m := range playMilestones {
-		if count < m {
-			continue
-		}
-		res, err := tx.Exec(
-			`INSERT INTO manrocket_level_play_milestones (level_id, milestone, reached_at) VALUES (?, ?, ?)
-			 ON CONFLICT(level_id, milestone) DO NOTHING`,
-			levelID, m, now,
-		)
-		if err != nil {
-			return nil, err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return nil, err
-		}
-		if n == 0 {
-			continue
-		}
-		crossed = append(crossed, m)
-		if owner == "" {
-			continue
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO manrocket_notifications
-			 (recipient_install_id, type, actor_install_id, level_id, milestone, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			owner, notifPlayMilestone, actorInstallID, levelID, m, now,
-		); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return crossed, nil
 }
 
 func cleanInstallID(s string) (string, bool) {

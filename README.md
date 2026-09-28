@@ -94,6 +94,8 @@ Rows go to `manrocket_events`, `manrocket_crashes`, and `manrocket_bugreports`. 
 
 Public ManRocket community routes (`/v1/manrocket/levels`, level comments, `/v1/manrocket/notifications`, whiteboards, phrases, names, feedback, and `/v1/leaderboard`) do not take this key.
 
+Clients may emit `manrocket_level_play_start` and `manrocket_level_play_complete` on `POST /v1/manrocket/events` for analytics. Maker popularity ranking does not read those rows. It uses `POST /v1/manrocket/levels/<id>/play` and the denormalized `play_count` (see ManRocket Maker levels).
+
 ```bash
 curl -sS -X POST http://127.0.0.1:8090/v1/manrocket/events \
   -H 'Content-Type: application/json' \
@@ -141,27 +143,37 @@ Source: `leaderboard.go`. Public (no API key), CORS + rate-limited. Table `leade
 The `course` and `score` columns were added to the live table by guarded `ALTER TABLE`s (`ensureLeaderboardCourseColumn`, `ensureLeaderboardScoreColumn`).
 Delete a row: `sqlite3 data/events.db "DELETE FROM leaderboard WHERE id=?"`.
 
-## ManRocket levels, comments, and notifications
+## ManRocket Maker levels
 
-Public (no API key), CORS + rate-limited — the same bucket as the other community routes (2 req/s/IP sustained, burst 20). Level upload, list, get, and vote live in `manrocket_levels.go`. Comments live in `manrocket_comments.go`. The inbox and the play-milestone hook live in `manrocket_notifications.go`.
+Source: `manrocket_levels.go`. Public (no API key), CORS + rate-limited — same as votes: `install_id` in the JSON body, not `X-API-Key` / `MANROCKET_INGEST_API_KEY`.
 
-Likes are the existing vote route. There is no separate like resource.
-
-CORS `Access-Control-Allow-Methods` includes `PATCH` and `DELETE` so a browser can edit or remove a comment.
+Likes are the existing vote route. There is no separate like resource. CORS `Access-Control-Allow-Methods` includes `PATCH` and `DELETE` so a browser can edit or remove a comment.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/v1/manrocket/levels?sort=top\|new&limit=N` | `{ok, levels:[{id, title, author, votes, received_at, level}]}`. `sort=top` (default) or `new`. N ≤ 100 (default 40). |
-| POST | `/v1/manrocket/levels` | Level JSON `{id, title, author, install_id, ...}` → `{ok, id}`. The same `install_id` may update its level; a different install does not overwrite it. `id` ≤ 80, `install_id` ≤ 64. |
-| GET | `/v1/manrocket/levels/<id>` | `{ok, votes, level}` or 404. |
-| POST | `/v1/manrocket/levels/<id>/vote` | `{install_id, value}` → `{ok, votes}`. `value` is `1` or `-1`. One row per install; `votes` moves by the delta from that install's previous value. A transition **to** `+1` writes one `vote_on_your_level` notification to the level owner (`manrocket_levels.install_id`), once per voter. Flipping away and back to `+1` does not write another. No notification when the owner votes their own level, or on `-1`. |
+| POST | `/v1/manrocket/levels` | Upload or replace a Maker level (`id` ≤ 80, plus `title`, `author`, `install_id`, and the level JSON). Replace only when `install_id` matches the row. Votes and play counts are kept. → `{ok, id}` |
+| GET | `/v1/manrocket/levels?sort=top\|new\|plays[&limit=N][&offset=N]` | `{ok, levels:[{id, title, author, votes, play_count, completion_count, received_at, level}]}`. `top` (default; any other `sort` value too): `votes DESC, received_at DESC`. `new`: `received_at DESC`. `plays`: `play_count DESC, votes DESC, received_at DESC`. `limit` 1–100 (default 40). `offset` 0–10000 (default 0); omitted or invalid offset is 0. |
+| GET | `/v1/manrocket/levels/<id>` | `{ok, votes, play_count, completion_count, level}` or 404 |
+| POST | `/v1/manrocket/levels/<id>/vote` | `{install_id, value: 1\|-1}` → `{ok, votes}`. One row per install; a changed vote adjusts the denormalized total. A transition **to** `+1` writes one `vote_on_your_level` row in `manrocket_level_notifications` for the level owner, once per voter. Flipping away and back to `+1` does not write another. No row when the owner votes their own level, or on `-1`. |
+| POST | `/v1/manrocket/levels/<id>/play` | `{phase:"start"\|"complete", install_id, session_id}` → `{ok, play_count, completion_count, counted}`. `start` increments `play_count`. `complete` increments `completion_count`. Idempotent on `(level_id, session_id, phase)`: a retry returns `counted: false` and does not inflate either counter. Unknown level → 404. `install_id` and `session_id` are required, each ≤ 64. |
+
+`play_count` / `completion_count` are added on existing databases by `ensureManRocketLevelPlaySchema` (`ALTER TABLE`, duplicate column ignored). Dedup rows are `manrocket_level_plays`. `sort=plays` reads `play_count` on the level row. It does not aggregate `manrocket_events`.
+
+A counted `start` that moves `play_count` across 1, 10, 100, or 500 inserts one `manrocket_level_milestones` row (`level_id`, `threshold`, `reached_at`; primary key on level + threshold) and one `manrocket_level_notifications` row for the level owner (`kind=play_milestone`, `threshold` = that count). A retry, a later play that does not cross a new threshold, or a `complete` does not insert again. Those rows show up in the inbox below. Uniqueness for `kind=play_milestone` is still one row per level + threshold (`idx_mr_notif_play_once`). The old table-level `UNIQUE (level_id, kind, threshold)` is rebuilt into that partial index so comment and vote rows on the same level do not collide with it.
+
+## ManRocket comments and notification inbox
+
+Comments: `manrocket_comments.go`. Inbox: `manrocket_notifications.go`. Same public rules as levels (no API key, `install_id` ownership). Inbox rows are `manrocket_level_notifications` — the play stub table, extended with `actor_install_id`, `comment_id`, and `read_at`. `install_id` on that table is the recipient.
+
+| Method | Path | Purpose |
+|---|---|---|
 | GET | `/v1/manrocket/levels/<id>/comments` | `{ok, sort, comments:[...]}`. `sort=new` (default): flat, newest first. `sort=thread` (alias `threaded`): top-level comments newest first, each with `replies` oldest-first (nested). `reply_to` or `parent_id` keeps only direct replies of that comment. `limit` ≤ 100 (default 40), `offset` ≤ 10000. Unknown level → 404. Thread view is assembled from the newest 500 live comments on the level. |
 | POST | `/v1/manrocket/levels/<id>/comments` | `{install_id, author?, body, reply_to?}` → `{ok, id, comment}`. `body` required, ≤ 500 runes (400 `empty` / `too long`). `author` optional, cleaned like a level author (empty → `anon`). `reply_to` must be a live comment on this level (400 `bad reply_to`). Caps: 40/install + 120/IP-hash per 24 h, including soft-deleted rows (429 `daily comment limit reached`). Writes `comment_on_your_level` to the level owner and, when `reply_to` is set, `reply_to_you` to that comment's `install_id`. No notification to yourself. |
 | PATCH | `/v1/manrocket/levels/<id>/comments/<comment_id>` | `{install_id, body?, author?}` → `{ok, comment}`. At least one of `body` / `author`. Only the comment's `install_id` (403 `forbidden`). 404 if missing or already soft-deleted. |
 | DELETE | `/v1/manrocket/levels/<id>/comments/<comment_id>` | `install_id` in the JSON body or `?install_id=`. Soft-delete (`deleted_at` set; the row stays, list hides it). Same owner rule. |
 | POST | `/v1/manrocket/levels/<id>/comments/<comment_id>/delete` | Same as DELETE, for clients that cannot send a DELETE body. |
-| GET | `/v1/manrocket/notifications?install_id=` | `{ok, notifications:[...]}` newest first. `install_id` required. `limit` ≤ 100 (default 40), `offset` ≤ 10000. `unread=1` (also `true` / `yes`) returns rows with `read_at` null. |
-| POST | `/v1/manrocket/notifications/read` | `{install_id, ids:[...]}` or `{install_id, all:true}` → `{ok, updated}`. Only rows addressed to that `install_id` are marked, and already-read rows are not counted again. `ids` ≤ 200. `all:true` ignores `ids`. |
+| GET | `/v1/manrocket/notifications?install_id=` | `{ok, notifications:[...]}` newest first. `install_id` required. Includes stub `play_milestone` rows already in the table. `limit` ≤ 100 (default 40), `offset` ≤ 10000. `unread=1` (also `true` / `yes`) returns rows with `read_at` null. |
+| POST | `/v1/manrocket/notifications/read` | `{install_id, ids:[...]}` or `{install_id, all:true}` → `{ok, updated}`. Only rows whose `install_id` is that recipient are marked, including play-milestone stubs. Already-read rows are not counted again. `ids` ≤ 200. `all:true` ignores `ids`. |
 
 Comment object:
 
@@ -171,29 +183,15 @@ Comment object:
 
 `sort=thread` adds `"replies":[ ...same shape... ]`. `reply_to` is the parent comment id, or null.
 
-Notification object:
+Notification object (`type` and `kind` are the same string; `kind` is the column):
 
 ```json
-{"id":1,"type":"comment_on_your_level","actor_install_id":"uuid","level_id":"pad","comment_id":1,"milestone":null,"created_at":1710000000000,"read_at":null,"read":false}
+{"id":1,"type":"play_milestone","kind":"play_milestone","actor_install_id":null,"level_id":"pad","comment_id":null,"milestone":10,"created_at":1710000000000,"read_at":null,"read":false}
 ```
 
-`type` is `comment_on_your_level`, `reply_to_you`, `vote_on_your_level`, or `play_milestone`. `comment_id` is set for the comment types. `milestone` is 1, 10, 100, or 500 for `play_milestone`. Otherwise those fields are null. `read` is true once `read_at` is set.
+`kind` is `comment_on_your_level`, `reply_to_you`, `vote_on_your_level`, or `play_milestone`. `comment_id` is set for the comment kinds. `milestone` is the `threshold` column (1, 10, 100, or 500) for `play_milestone`, otherwise null. Play stubs written before this inbox have an empty actor. `read` is true once `read_at` is set.
 
 Client errors are `{"ok":false,"reason":"..."}` with 400, 403, 404, or 429.
-
-### Play milestones (hook, no HTTP route yet)
-
-No play route exists on main. The play route should call this once per play instead of keeping a second counter:
-
-```go
-crossed, err := store.NoteManRocketLevelPlay(levelID, actorInstallID, nowUnixMilli)
-```
-
-- Increments `manrocket_level_play_counts.play_count` for that level.
-- The first time the count reaches 1, 10, 100, or 500, inserts `manrocket_level_play_milestones` (`PRIMARY KEY (level_id, milestone)`) and a `play_milestone` notification for the level owner.
-- Returns the milestones newly crossed (empty if this play crossed none).
-- `sql.ErrNoRows` if the level does not exist — nothing is written.
-- `nowUnixMilli` ≤ 0 means `time.Now()`.
 
 Soft-deleted comments stay in `manrocket_level_comments` with `deleted_at` set. Hard-delete: `sqlite3 data/events.db "DELETE FROM manrocket_level_comments WHERE id=?"`.
 

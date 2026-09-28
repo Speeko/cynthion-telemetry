@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -36,6 +36,7 @@ type commentList struct {
 type notifView struct {
 	ID        int64   `json:"id"`
 	Type      string  `json:"type"`
+	Kind      string  `json:"kind"`
 	Actor     string  `json:"actor_install_id"`
 	LevelID   *string `json:"level_id"`
 	CommentID *int64  `json:"comment_id"`
@@ -121,7 +122,7 @@ func countNotifs(t *testing.T, s *server, recipient, typ string) int {
 	t.Helper()
 	var n int
 	err := s.store.db.QueryRow(
-		`SELECT COUNT(1) FROM manrocket_notifications WHERE recipient_install_id=? AND type=?`,
+		`SELECT COUNT(1) FROM manrocket_level_notifications WHERE install_id=? AND kind=?`,
 		recipient, typ,
 	).Scan(&n)
 	if err != nil {
@@ -606,61 +607,50 @@ func TestNotificationRead(t *testing.T) {
 	mustJSONStatus(t, status, raw, http.StatusMethodNotAllowed)
 }
 
-func TestPlayMilestoneHook(t *testing.T) {
+func TestPlayMilestoneShowsInInbox(t *testing.T) {
 	s, ts := newIngestTestServer(t, testManRocketKey)
-	if _, err := s.store.NoteManRocketLevelPlay("missing", "pilot", 1); !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("missing level: %v", err)
-	}
-	var n int
-	if err := s.store.db.QueryRow(`SELECT COUNT(1) FROM manrocket_level_play_counts`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-	if n != 0 || countNotifs(t, s, "owner", notifPlayMilestone) != 0 {
-		t.Fatal("missing level wrote play state")
-	}
-
 	uploadCourse(t, ts, "pad", "owner", "ada")
-	play := func(now int64) []int {
-		t.Helper()
-		crossed, err := s.store.NoteManRocketLevelPlay("pad", "owner", now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return crossed
-	}
-	if got := play(1_000); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("first play crossed %v", got)
-	}
-	if got := play(2_000); len(got) != 0 {
-		t.Fatalf("second play crossed %v", got)
-	}
-	setPlayCount(t, s, "pad", 9)
-	if got := play(3_000); len(got) != 1 || got[0] != 10 {
-		t.Fatalf("10 crossed %v", got)
-	}
-	setPlayCount(t, s, "pad", 99)
-	if got := play(4_000); len(got) != 1 || got[0] != 100 {
-		t.Fatalf("100 crossed %v", got)
-	}
-	setPlayCount(t, s, "pad", 499)
-	if got := play(5_000); len(got) != 1 || got[0] != 500 {
-		t.Fatalf("500 crossed %v", got)
-	}
-	if got := play(6_000); len(got) != 0 {
-		t.Fatalf("past 500 crossed %v", got)
-	}
-	var count int
-	if err := s.store.db.QueryRow(`SELECT play_count FROM manrocket_level_play_counts WHERE level_id=?`, "pad").Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if count != 501 {
-		t.Fatalf("play_count=%d", count)
-	}
-	if countNotifs(t, s, "owner", notifPlayMilestone) != 4 {
-		t.Fatalf("milestone notifications=%d", countNotifs(t, s, "owner", notifPlayMilestone))
+
+	status, _, raw := playMR(t, ts.URL, "pad", "complete", "pilot", "sess-c")
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if countNotifs(t, s, "owner", notifPlayMilestone) != 0 {
+		t.Fatal("completion wrote a play milestone")
 	}
 
-	status, raw := doJSON(t, http.MethodGet, ts.URL+"/v1/manrocket/notifications?install_id=owner&unread=yes", nil)
+	status, body, raw := playMR(t, ts.URL, "pad", "start", "pilot", "sess-1")
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if body["counted"] != true || body["play_count"] != float64(1) {
+		t.Fatalf("first start: %s", raw)
+	}
+	status, body, raw = playMR(t, ts.URL, "pad", "start", "pilot", "sess-1")
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if body["counted"] != false || body["play_count"] != float64(1) {
+		t.Fatalf("retry: %s", raw)
+	}
+	if countNotifs(t, s, "owner", notifPlayMilestone) != 1 {
+		t.Fatalf("milestone rows=%d", countNotifs(t, s, "owner", notifPlayMilestone))
+	}
+
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET play_count=9 WHERE id='pad'`); err != nil {
+		t.Fatal(err)
+	}
+	status, _, raw = playMR(t, ts.URL, "pad", "start", "pilot", "sess-10")
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET play_count=99 WHERE id='pad'`); err != nil {
+		t.Fatal(err)
+	}
+	status, _, raw = playMR(t, ts.URL, "pad", "start", "pilot", "sess-100")
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET play_count=499 WHERE id='pad'`); err != nil {
+		t.Fatal(err)
+	}
+	status, _, raw = playMR(t, ts.URL, "pad", "start", "pilot", "sess-500")
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if countNotifs(t, s, "owner", notifPlayMilestone) != 4 {
+		t.Fatalf("milestone rows=%d", countNotifs(t, s, "owner", notifPlayMilestone))
+	}
+
+	status, raw = doJSON(t, http.MethodGet, ts.URL+"/v1/manrocket/notifications?install_id=owner&unread=yes", nil)
 	mustJSONStatus(t, status, raw, http.StatusOK)
 	inbox := decodeNotifs(t, raw)
 	if len(inbox.Notifications) != 4 {
@@ -668,27 +658,154 @@ func TestPlayMilestoneHook(t *testing.T) {
 	}
 	gotMiles := map[int64]bool{}
 	for _, item := range inbox.Notifications {
-		if item.Type != notifPlayMilestone || item.Milestone == nil || item.Actor != "owner" {
+		if item.Type != notifPlayMilestone || item.Kind != notifPlayMilestone || item.Milestone == nil || item.Actor != "" {
+			t.Fatalf("milestone row: %+v", item)
+		}
+		if item.LevelID == nil || *item.LevelID != "pad" || item.CommentID != nil {
 			t.Fatalf("milestone row: %+v", item)
 		}
 		gotMiles[*item.Milestone] = true
 	}
-	for _, m := range playMilestones {
+	for _, m := range mrPlayMilestoneThresholds {
 		if !gotMiles[int64(m)] {
 			t.Fatalf("missing milestone %d in %+v", m, inbox.Notifications)
 		}
 	}
+
+	status, raw = doJSON(t, http.MethodPost, ts.URL+"/v1/manrocket/notifications/read", map[string]any{
+		"install_id": "owner",
+		"all":        true,
+	})
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if decodeNotifs(t, raw).Updated != 4 {
+		t.Fatalf("mark play rows: %s", raw)
+	}
+	status, raw = doJSON(t, http.MethodGet, ts.URL+"/v1/manrocket/notifications?install_id=owner&unread=1", nil)
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if len(decodeNotifs(t, raw).Notifications) != 0 {
+		t.Fatalf("play rows still unread: %s", raw)
+	}
 }
 
-func setPlayCount(t *testing.T, s *server, levelID string, n int) {
-	t.Helper()
-	res, err := s.store.db.Exec(`UPDATE manrocket_level_play_counts SET play_count=? WHERE level_id=?`, n, levelID)
+func TestInboxReadsLegacyPlayMilestoneRow(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "events.db")
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rawDB.Exec(`CREATE TABLE manrocket_level_notifications (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		level_id TEXT NOT NULL,
+		install_id TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		threshold INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		UNIQUE (level_id, kind, threshold)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rawDB.Exec(`INSERT INTO manrocket_level_notifications
+		(level_id, install_id, kind, threshold, created_at)
+		VALUES ('pad', 'owner-a', 'play_milestone', 10, 111)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := rawDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := openStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := store
+	t.Cleanup(func() {
+		if current != nil {
+			current.Close()
+		}
+	})
+	s := &server{
+		cfg:             Config{APIKey: testCynthionKey, ManRocketAPIKey: testManRocketKey},
+		store:           store,
+		limiter:         newIPLimiter(1000, 10000),
+		bugReportDir:    filepath.Join(dir, "bugreports"),
+		manrocketBugDir: filepath.Join(dir, "manrocket_bugreports"),
+	}
+	ts := httptest.NewServer(s.handler())
+	tsClosed := false
+	t.Cleanup(func() {
+		if !tsClosed {
+			ts.Close()
+		}
+	})
+
+	status, raw := doJSON(t, http.MethodGet, ts.URL+"/v1/manrocket/notifications?install_id=owner-a&unread=1", nil)
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	inbox := decodeNotifs(t, raw)
+	if len(inbox.Notifications) != 1 {
+		t.Fatalf("legacy inbox: %+v", inbox.Notifications)
+	}
+	stub := inbox.Notifications[0]
+	if stub.Type != notifPlayMilestone || stub.Kind != notifPlayMilestone || stub.Milestone == nil || *stub.Milestone != 10 || stub.Read || stub.Actor != "" {
+		t.Fatalf("legacy stub: %+v", stub)
+	}
+
+	uploadCourse(t, ts, "pad", "owner-a", "ada")
+	status, raw = doJSON(t, http.MethodPost, commentsURL(ts, "pad"), map[string]any{
+		"install_id": "pilot-b",
+		"author":     "bea",
+		"body":       "on a played level",
+	})
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if countNotifs(t, s, "owner-a", notifPlayMilestone) != 1 {
+		t.Fatal("comment disturbed the play milestone row")
+	}
+	if countNotifs(t, s, "owner-a", notifCommentOnLevel) != 1 {
+		t.Fatal("comment notification missing beside the stub")
+	}
+
+	res, err := store.db.Exec(`INSERT INTO manrocket_level_notifications
+		(level_id, install_id, kind, threshold, created_at)
+		VALUES ('pad', 'owner-a', 'play_milestone', 10, 222)
+		ON CONFLICT(level_id, kind, threshold) WHERE kind = 'play_milestone' DO NOTHING`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	aff, err := res.RowsAffected()
-	if err != nil || aff != 1 {
-		t.Fatalf("set play count aff=%d err=%v", aff, err)
+	if err != nil || aff != 0 || countNotifs(t, s, "owner-a", notifPlayMilestone) != 1 {
+		t.Fatalf("duplicate milestone aff=%d err=%v count=%d", aff, err, countNotifs(t, s, "owner-a", notifPlayMilestone))
+	}
+
+	status, raw = doJSON(t, http.MethodPost, ts.URL+"/v1/manrocket/notifications/read", map[string]any{
+		"install_id": "owner-a",
+		"ids":        []int64{stub.ID},
+	})
+	mustJSONStatus(t, status, raw, http.StatusOK)
+	if decodeNotifs(t, raw).Updated != 1 {
+		t.Fatalf("mark stub: %s", raw)
+	}
+
+	tsClosed = true
+	ts.Close()
+	if err := current.Close(); err != nil {
+		t.Fatal(err)
+	}
+	current = nil
+	reopened, err := openStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current = reopened
+	var readAt sql.NullInt64
+	var n int
+	if err := reopened.db.QueryRow(
+		`SELECT read_at, (SELECT COUNT(1) FROM manrocket_level_notifications WHERE install_id='owner-a' AND kind='play_milestone')
+		 FROM manrocket_level_notifications WHERE id=?`, stub.ID,
+	).Scan(&readAt, &n); err != nil {
+		t.Fatal(err)
+	}
+	if !readAt.Valid || n != 1 {
+		t.Fatalf("reopen read_at=%v milestone rows=%d", readAt, n)
 	}
 }
 

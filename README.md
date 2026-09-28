@@ -92,7 +92,9 @@ Source: `manrocket_ingest.go`. This is the ManRocket game under Runed Poodle tel
 
 Rows go to `manrocket_events`, `manrocket_crashes`, and `manrocket_bugreports`. Zips go to `data/manrocket_bugreports/<received_ms>_<install8>.zip`. Nothing is inserted into `events`, `crashes`, or `bugreports`, and nothing is written under `data/bugreports/`.
 
-Public ManRocket community routes (`/v1/manrocket/levels`, whiteboards, phrases, names, feedback, and `/v1/leaderboard`) are unchanged and do not take this key.
+Public ManRocket community routes (`/v1/manrocket/levels`, whiteboards, phrases, names, feedback, and `/v1/leaderboard`) do not take this key.
+
+Clients may emit `manrocket_level_play_start` and `manrocket_level_play_complete` on `POST /v1/manrocket/events` for analytics. Maker popularity ranking does not read those rows. It uses `POST /v1/manrocket/levels/<id>/play` and the denormalized `play_count` (see ManRocket Maker levels).
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8090/v1/manrocket/events \
@@ -140,6 +142,20 @@ Source: `leaderboard.go`. Public (no API key), CORS + rate-limited. Table `leade
 
 The `course` and `score` columns were added to the live table by guarded `ALTER TABLE`s (`ensureLeaderboardCourseColumn`, `ensureLeaderboardScoreColumn`).
 Delete a row: `sqlite3 data/events.db "DELETE FROM leaderboard WHERE id=?"`.
+
+## ManRocket Maker levels
+
+Source: `manrocket_levels.go`. Public (no API key), CORS + rate-limited — same as votes: `install_id` in the JSON body, not `X-API-Key` / `MANROCKET_INGEST_API_KEY`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/manrocket/levels` | Upload or replace a Maker level (`id` ≤ 80, plus `title`, `author`, `install_id`, and the level JSON). Replace only when `install_id` matches the row. Votes and play counts are kept. → `{ok, id}` |
+| GET | `/v1/manrocket/levels?sort=top\|new\|plays[&limit=N][&offset=N]` | `{ok, levels:[{id, title, author, votes, play_count, completion_count, received_at, level}]}`. `top` (default; any other `sort` value too): `votes DESC, received_at DESC`. `new`: `received_at DESC`. `plays`: `play_count DESC, votes DESC, received_at DESC`. `limit` 1–100 (default 40). `offset` 0–10000 (default 0); omitted or invalid offset is 0. |
+| GET | `/v1/manrocket/levels/<id>` | `{ok, votes, play_count, completion_count, level}` or 404 |
+| POST | `/v1/manrocket/levels/<id>/vote` | `{install_id, value: 1\|-1}` → `{ok, votes}`. One row per install; a changed vote adjusts the denormalized total. |
+| POST | `/v1/manrocket/levels/<id>/play` | `{phase:"start"\|"complete", install_id, session_id}` → `{ok, play_count, completion_count, counted}`. `start` increments `play_count`. `complete` increments `completion_count`. Idempotent on `(level_id, session_id, phase)`: a retry returns `counted: false` and does not inflate either counter. Unknown level → 404. `install_id` and `session_id` are required, each ≤ 64. |
+
+`play_count` / `completion_count` are added on existing databases by `ensureManRocketLevelPlaySchema` (`ALTER TABLE`, duplicate column ignored). Dedup rows are `manrocket_level_plays`. `sort=plays` reads `play_count` on the level row. It does not aggregate `manrocket_events`.
 
 ## ManRocket whiteboards
 

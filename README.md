@@ -1,17 +1,23 @@
-# cynthion-telemetry
+# Runed Poodle telemetry
 
-Tiny Go HTTP ingest for Cynthion game telemetry and ManRocket analytics. SQLite storage, single binary, behind Caddy on `api.cynthiongame.com`. ManRocket analytics uses the same request shapes as Cynthion ingest, a separate API key, and its own tables — it does not write `events`, `crashes`, or `bugreports`.
+Runed Poodle telemetry is the shared ingest for multiple games. This process currently hosts **Cynthion** and **ManRocket** in one SQLite database, behind Caddy on `api.cynthiongame.com`. The public hostname is unchanged. The repo, Docker image, container, and droplet directory are still named `cynthion-telemetry`.
+
+Cynthion stays on the existing unprefixed routes (`POST /v1/events`, `/v1/crash`, `/v1/bugreport`) and tables (`events`, `crashes`, `bugreports`). Renaming those paths is a later migration.
+
+ManRocket is game-scoped on `/v1/manrocket/events`, `/v1/manrocket/crash`, and `/v1/manrocket/bugreport`. It uses `MANROCKET_INGEST_API_KEY` and its own tables (`manrocket_events`, `manrocket_crashes`, `manrocket_bugreports`). Request shapes match Cynthion ingest.
 
 ## Layout
 
 - `main.go` — Cynthion ingest, store, routing
-- `manrocket_ingest.go` — ManRocket analytics ingest (separate tables + key)
+- `manrocket_ingest.go` — ManRocket ingest under Runed Poodle (own tables + `MANROCKET_INGEST_API_KEY`)
 - `Dockerfile` — multi-stage build, runs non-root on Alpine
 - `docker-compose.yml` — bound to `127.0.0.1:8090` on host (Caddy proxies via `host.docker.internal:8090`)
 - `data/` — SQLite at `./data/events.db` (WAL mode); bug-report zips in `data/bugreports/` and `data/manrocket_bugreports/`
 - `.env` — `INGEST_API_KEY`, `MANROCKET_INGEST_API_KEY`, `MANROCKET_ADMIN_KEY` (gitignored)
 
 ## Endpoints
+
+Cynthion uses the unprefixed `/v1/events`, `/v1/crash`, and `/v1/bugreport` paths on `api.cynthiongame.com`. ManRocket uses the `/v1/manrocket/…` routes on that same host.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
@@ -80,9 +86,9 @@ The zip is written to `data/bugreports/<received_ms>_<install8>.zip`; a metadata
 
 Response: `{"ok":true,"id":<rowid>,"archive":"<filename>.zip"}`
 
-## ManRocket analytics ingest
+## ManRocket ingest (Runed Poodle)
 
-Source: `manrocket_ingest.go`. Same JSON / multipart shapes as the Cynthion routes above, including the optional batch fields `steam_id`, `persona_name`, `country`, and `language`. Auth header is still `X-API-Key`, checked against **`MANROCKET_INGEST_API_KEY`** (not `INGEST_API_KEY`). A missing, wrong, or shorter-than-24-character key returns `401 unauthorized` and writes nothing. The process still boots if the var is unset, so Cynthion ingest keeps working; these three routes stay closed until Homelab sets the key and recreates the container.
+Source: `manrocket_ingest.go`. This is the ManRocket game under Runed Poodle telemetry, on the manrocket-prefixed routes. Same JSON / multipart shapes as the Cynthion routes above, including the optional batch fields `steam_id`, `persona_name`, `country`, and `language`. Auth header is `X-API-Key`, checked against **`MANROCKET_INGEST_API_KEY`**. A missing, wrong, or shorter-than-24-character key returns `401 unauthorized` and writes nothing. The process still boots if the var is unset, so Cynthion ingest keeps working; these three routes stay closed until Homelab sets the key and recreates the container.
 
 Rows go to `manrocket_events`, `manrocket_crashes`, and `manrocket_bugreports`. Zips go to `data/manrocket_bugreports/<received_ms>_<install8>.zip`. Nothing is inserted into `events`, `crashes`, or `bugreports`, and nothing is written under `data/bugreports/`.
 
@@ -274,7 +280,7 @@ scp root@170.64.160.249:/srv/cynthion-telemetry/data/manrocket_bugreports/<archi
 ssh root@170.64.160.249 'sqlite3 /srv/cynthion-telemetry/data/events.db "DELETE FROM events WHERE install_id=?; DELETE FROM crashes WHERE install_id=?" <UUID> <UUID>'
 ```
 
-ManRocket analytics rows live in their own tables (and zips under `data/manrocket_bugreports/`, named with the first 8 characters of `install_id`):
+ManRocket rows live in their own tables (and zips under `data/manrocket_bugreports/`, named with the first 8 characters of `install_id`):
 
 ```bash
 ssh root@170.64.160.249 "sqlite3 /srv/cynthion-telemetry/data/events.db \"DELETE FROM manrocket_events WHERE install_id='<UUID>'; DELETE FROM manrocket_crashes WHERE install_id='<UUID>'; DELETE FROM manrocket_bugreports WHERE install_id='<UUID>';\""

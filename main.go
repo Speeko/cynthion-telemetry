@@ -1,12 +1,18 @@
-// Cynthion telemetry ingest endpoint, plus ManRocket analytics ingest
-// (manrocket_ingest.go) on its own tables and API key.
+// Runed Poodle telemetry: one ingest process hosting multiple games.
 //
-// Cynthion write endpoints: POST /v1/events, POST /v1/crash, POST /v1/bugreport.
-// ManRocket write endpoints: POST /v1/manrocket/events, /v1/manrocket/crash, /v1/manrocket/bugreport.
-// Plus a /health probe and the public ManRocket community routes.
+// Cynthion stays on POST /v1/events, POST /v1/crash, POST /v1/bugreport
+// (INGEST_API_KEY, tables events/crashes/bugreports). Those paths are not
+// renamed here; that is a later migration.
+// ManRocket is game-scoped on POST /v1/manrocket/events, /v1/manrocket/crash,
+// and /v1/manrocket/bugreport (MANROCKET_INGEST_API_KEY, manrocket_* tables).
+// See manrocket_ingest.go. Public ManRocket community routes are separate.
+// Plus a /health probe.
 // SQLite storage (modernc.org/sqlite — pure Go, no CGO).
-// Auth: X-API-Key header. Cynthion uses INGEST_API_KEY; ManRocket ingest uses MANROCKET_INGEST_API_KEY.
+// Auth: X-API-Key header.
 // Rate limit: per-IP token bucket via golang.org/x/time/rate.
+//
+// The binary, Docker image, and public host are still cynthion-telemetry /
+// api.cynthiongame.com.
 //
 // Designed for the cynthion-au droplet:
 //   - Listens on :8090 inside Docker, port mapped to 127.0.0.1:8090 on host
@@ -419,6 +425,8 @@ type server struct {
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {
+	// Service id in the probe body stays "cynthion-telemetry". The product
+	// name is Runed Poodle; the public hostname is still api.cynthiongame.com.
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"ok":true,"service":"cynthion-telemetry"}`))
 }
@@ -629,6 +637,7 @@ func main() {
 	}
 
 	go func() {
+		// Log line keeps the historical process name. The product is Runed Poodle.
 		log.Printf("cynthion-telemetry listening on %s", cfg.Listen)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)

@@ -1,7 +1,15 @@
-// ManRocket analytics ingest. Same request shape as Cynthion's
-// POST /v1/events, /v1/crash, and /v1/bugreport, but a different API key
-// and different tables/files. These handlers never write the Cynthion
-// events, crashes, or bugreports tables (or data/bugreports/).
+// ManRocket ingest under Runed Poodle telemetry.
+//
+// Runed Poodle hosts multiple games on this process. ManRocket is
+// game-scoped at POST /v1/manrocket/events, /v1/manrocket/crash, and
+// /v1/manrocket/bugreport. Cynthion keeps POST /v1/events, /v1/crash, and
+// /v1/bugreport (unchanged in this change; a later migration may rename them).
+// The public host stays api.cynthiongame.com.
+//
+// Request shapes match Cynthion ingest. Storage is ManRocket-only:
+// manrocket_events, manrocket_crashes, manrocket_bugreports, and
+// data/manrocket_bugreports/. These handlers do not write the Cynthion
+// events, crashes, or bugreports tables, or data/bugreports/.
 //
 // Auth: X-API-Key against MANROCKET_INGEST_API_KEY. Missing, short (<24),
 // or mismatched keys return 401. INGEST_API_KEY is not accepted here.

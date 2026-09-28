@@ -15,7 +15,8 @@ services:
       - ./data:/data
     ports:
       # Loopback for local curls; public traffic is Caddy on cynthion-net
-      # (api.cynthiongame.com → cynthion-telemetry:8090).
+      # (api.cynthiongame.com → cynthion-telemetry:8090). Hostname unchanged.
+      # This container is Runed Poodle telemetry (Cynthion + ManRocket).
       - "127.0.0.1:8090:8090"
     networks:
       - default

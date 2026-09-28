@@ -223,6 +223,9 @@ func openStore(path string) (*Store, error) {
 	if err := st.ensureManRocketIngestSchema(); err != nil {
 		return nil, fmt.Errorf("manrocket ingest schema: %w", err)
 	}
+	if err := st.ensureManRocketSocialSchema(); err != nil {
+		return nil, fmt.Errorf("manrocket social schema: %w", err)
+	}
 	return st, nil
 }
 
@@ -590,6 +593,8 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("/v1/leaderboard", s.withCORS(s.withRateLimit(s.leaderboard)))
 	mux.HandleFunc("/v1/manrocket/levels/", s.withCORS(s.withRateLimit(s.manrocketLevels)))
 	mux.HandleFunc("/v1/manrocket/levels", s.withCORS(s.withRateLimit(s.manrocketLevels)))
+	mux.HandleFunc("/v1/manrocket/notifications/", s.withCORS(s.withRateLimit(s.manrocketNotifications)))
+	mux.HandleFunc("/v1/manrocket/notifications", s.withCORS(s.withRateLimit(s.manrocketNotifications)))
 	mux.HandleFunc("/v1/manrocket/whiteboards/", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
 	mux.HandleFunc("/v1/manrocket/whiteboards", s.withCORS(s.withRateLimit(s.manrocketWhiteboards)))
 	mux.HandleFunc("/v1/manrocket/phrases/", s.withCORS(s.manrocketPhrases)) // rate-limits itself (wavs looser)

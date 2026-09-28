@@ -92,7 +92,7 @@ Source: `manrocket_ingest.go`. This is the ManRocket game under Runed Poodle tel
 
 Rows go to `manrocket_events`, `manrocket_crashes`, and `manrocket_bugreports`. Zips go to `data/manrocket_bugreports/<received_ms>_<install8>.zip`. Nothing is inserted into `events`, `crashes`, or `bugreports`, and nothing is written under `data/bugreports/`.
 
-Public ManRocket community routes (`/v1/manrocket/levels`, whiteboards, phrases, names, feedback, and `/v1/leaderboard`) are unchanged and do not take this key.
+Public ManRocket community routes (`/v1/manrocket/levels`, level comments, `/v1/manrocket/notifications`, whiteboards, phrases, names, feedback, and `/v1/leaderboard`) do not take this key.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8090/v1/manrocket/events \
@@ -140,6 +140,62 @@ Source: `leaderboard.go`. Public (no API key), CORS + rate-limited. Table `leade
 
 The `course` and `score` columns were added to the live table by guarded `ALTER TABLE`s (`ensureLeaderboardCourseColumn`, `ensureLeaderboardScoreColumn`).
 Delete a row: `sqlite3 data/events.db "DELETE FROM leaderboard WHERE id=?"`.
+
+## ManRocket levels, comments, and notifications
+
+Public (no API key), CORS + rate-limited — the same bucket as the other community routes (2 req/s/IP sustained, burst 20). Level upload, list, get, and vote live in `manrocket_levels.go`. Comments live in `manrocket_comments.go`. The inbox and the play-milestone hook live in `manrocket_notifications.go`.
+
+Likes are the existing vote route. There is no separate like resource.
+
+CORS `Access-Control-Allow-Methods` includes `PATCH` and `DELETE` so a browser can edit or remove a comment.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/v1/manrocket/levels?sort=top\|new&limit=N` | `{ok, levels:[{id, title, author, votes, received_at, level}]}`. `sort=top` (default) or `new`. N ≤ 100 (default 40). |
+| POST | `/v1/manrocket/levels` | Level JSON `{id, title, author, install_id, ...}` → `{ok, id}`. The same `install_id` may update its level; a different install does not overwrite it. `id` ≤ 80, `install_id` ≤ 64. |
+| GET | `/v1/manrocket/levels/<id>` | `{ok, votes, level}` or 404. |
+| POST | `/v1/manrocket/levels/<id>/vote` | `{install_id, value}` → `{ok, votes}`. `value` is `1` or `-1`. One row per install; `votes` moves by the delta from that install's previous value. A transition **to** `+1` writes one `vote_on_your_level` notification to the level owner (`manrocket_levels.install_id`), once per voter. Flipping away and back to `+1` does not write another. No notification when the owner votes their own level, or on `-1`. |
+| GET | `/v1/manrocket/levels/<id>/comments` | `{ok, sort, comments:[...]}`. `sort=new` (default): flat, newest first. `sort=thread` (alias `threaded`): top-level comments newest first, each with `replies` oldest-first (nested). `reply_to` or `parent_id` keeps only direct replies of that comment. `limit` ≤ 100 (default 40), `offset` ≤ 10000. Unknown level → 404. Thread view is assembled from the newest 500 live comments on the level. |
+| POST | `/v1/manrocket/levels/<id>/comments` | `{install_id, author?, body, reply_to?}` → `{ok, id, comment}`. `body` required, ≤ 500 runes (400 `empty` / `too long`). `author` optional, cleaned like a level author (empty → `anon`). `reply_to` must be a live comment on this level (400 `bad reply_to`). Caps: 40/install + 120/IP-hash per 24 h, including soft-deleted rows (429 `daily comment limit reached`). Writes `comment_on_your_level` to the level owner and, when `reply_to` is set, `reply_to_you` to that comment's `install_id`. No notification to yourself. |
+| PATCH | `/v1/manrocket/levels/<id>/comments/<comment_id>` | `{install_id, body?, author?}` → `{ok, comment}`. At least one of `body` / `author`. Only the comment's `install_id` (403 `forbidden`). 404 if missing or already soft-deleted. |
+| DELETE | `/v1/manrocket/levels/<id>/comments/<comment_id>` | `install_id` in the JSON body or `?install_id=`. Soft-delete (`deleted_at` set; the row stays, list hides it). Same owner rule. |
+| POST | `/v1/manrocket/levels/<id>/comments/<comment_id>/delete` | Same as DELETE, for clients that cannot send a DELETE body. |
+| GET | `/v1/manrocket/notifications?install_id=` | `{ok, notifications:[...]}` newest first. `install_id` required. `limit` ≤ 100 (default 40), `offset` ≤ 10000. `unread=1` (also `true` / `yes`) returns rows with `read_at` null. |
+| POST | `/v1/manrocket/notifications/read` | `{install_id, ids:[...]}` or `{install_id, all:true}` → `{ok, updated}`. Only rows addressed to that `install_id` are marked, and already-read rows are not counted again. `ids` ≤ 200. `all:true` ignores `ids`. |
+
+Comment object:
+
+```json
+{"id":1,"level_id":"pad","install_id":"uuid","author":"ada","body":"nice pad","reply_to":null,"created_at":1710000000000,"updated_at":1710000000000}
+```
+
+`sort=thread` adds `"replies":[ ...same shape... ]`. `reply_to` is the parent comment id, or null.
+
+Notification object:
+
+```json
+{"id":1,"type":"comment_on_your_level","actor_install_id":"uuid","level_id":"pad","comment_id":1,"milestone":null,"created_at":1710000000000,"read_at":null,"read":false}
+```
+
+`type` is `comment_on_your_level`, `reply_to_you`, `vote_on_your_level`, or `play_milestone`. `comment_id` is set for the comment types. `milestone` is 1, 10, 100, or 500 for `play_milestone`. Otherwise those fields are null. `read` is true once `read_at` is set.
+
+Client errors are `{"ok":false,"reason":"..."}` with 400, 403, 404, or 429.
+
+### Play milestones (hook, no HTTP route yet)
+
+No play route exists on main. The play route should call this once per play instead of keeping a second counter:
+
+```go
+crossed, err := store.NoteManRocketLevelPlay(levelID, actorInstallID, nowUnixMilli)
+```
+
+- Increments `manrocket_level_play_counts.play_count` for that level.
+- The first time the count reaches 1, 10, 100, or 500, inserts `manrocket_level_play_milestones` (`PRIMARY KEY (level_id, milestone)`) and a `play_milestone` notification for the level owner.
+- Returns the milestones newly crossed (empty if this play crossed none).
+- `sql.ErrNoRows` if the level does not exist — nothing is written.
+- `nowUnixMilli` ≤ 0 means `time.Now()`.
+
+Soft-deleted comments stay in `manrocket_level_comments` with `deleted_at` set. Hard-delete: `sqlite3 data/events.db "DELETE FROM manrocket_level_comments WHERE id=?"`.
 
 ## ManRocket whiteboards
 

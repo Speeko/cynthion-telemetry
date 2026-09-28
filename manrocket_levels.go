@@ -26,6 +26,8 @@ func (s *server) manrocketLevels(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSuffix(path, "/vote")
 		id = strings.Trim(id, "/")
 		s.mrVote(w, r, id)
+	case isLevelCommentsPath(path):
+		s.mrComments(w, r, path)
 	case path != "" && r.Method == http.MethodGet:
 		s.mrGet(w, r, path)
 	default:
@@ -200,6 +202,11 @@ func (s *server) mrVote(w http.ResponseWriter, r *http.Request, id string) {
 	if err := tx.Commit(); err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
+	}
+	// Likes are this vote. A transition to +1 notifies the level owner once
+	// per voter (see notifyVoteOnLevel). The vote response stays {ok, votes}.
+	if in.Value == 1 && (!prev.Valid || prev.Int64 != 1) {
+		s.notifyVoteOnLevel(id, in.InstallID)
 	}
 	var votes int
 	_ = s.store.db.QueryRow(`SELECT votes FROM manrocket_levels WHERE id=?`, id).Scan(&votes)

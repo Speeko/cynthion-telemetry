@@ -39,7 +39,7 @@ func (s *server) withCORS(next http.HandlerFunc) http.HandlerFunc {
 		default:
 			// leave no ACAO for unknown origins on browser calls
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Admin-Key")
 		w.Header().Set("Vary", "Origin")
 		if r.Method == http.MethodOptions {

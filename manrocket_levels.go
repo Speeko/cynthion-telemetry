@@ -30,6 +30,8 @@ func (s *server) manrocketLevels(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSuffix(path, "/play")
 		id = strings.Trim(id, "/")
 		s.mrPlay(w, r, id)
+	case isLevelCommentsPath(path):
+		s.mrComments(w, r, path)
 	case path != "" && r.Method == http.MethodGet:
 		s.mrGet(w, r, path)
 	default:
@@ -219,6 +221,11 @@ func (s *server) mrVote(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
+	// Likes are this vote. A transition to +1 notifies the level owner once
+	// per voter (see notifyVoteOnLevel). The vote response stays {ok, votes}.
+	if in.Value == 1 && (!prev.Valid || prev.Int64 != 1) {
+		s.notifyVoteOnLevel(id, in.InstallID)
+	}
 	var votes int
 	_ = s.store.db.QueryRow(`SELECT votes FROM manrocket_levels WHERE id=?`, id).Scan(&votes)
 	w.Header().Set("Content-Type", "application/json")
@@ -346,7 +353,9 @@ func (st *Store) ensureManRocketLevelPlaySchema() error {
 	)`); err != nil {
 		return err
 	}
-	// Stub for a later inbox / FCM push. Nothing reads or sends these rows yet.
+	// Play-milestone rows. ensureManRocketSocialSchema adds actor_install_id,
+	// comment_id, and read_at; the inbox reads this table. Play inserts
+	// still list only the original columns.
 	if _, err := st.db.Exec(`CREATE TABLE IF NOT EXISTS manrocket_level_notifications (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		level_id TEXT NOT NULL,
@@ -362,8 +371,8 @@ func (st *Store) ensureManRocketLevelPlaySchema() error {
 	return err
 }
 
-// Play-count milestones. A later inbox and FCM push can consume the stub
-// notification rows; this path only persists them once.
+// Play-count milestones. The inbox lists these rows; FCM push is still later.
+// This path only persists each threshold once.
 var mrPlayMilestoneThresholds = [...]int{1, 10, 100, 500}
 
 const mrPlayMilestoneKind = "play_milestone"
@@ -405,10 +414,13 @@ func recordPlayMilestones(tx *sql.Tx, levelID string, now int64) error {
 		if n == 0 {
 			continue
 		}
+		// Partial unique index (kind = play_milestone) so comment and vote
+		// rows can share a level. The WHERE clause is what makes ON CONFLICT
+		// target that index. One row per level + threshold, same as before.
 		if _, err := tx.Exec(
 			`INSERT INTO manrocket_level_notifications (level_id, install_id, kind, threshold, created_at)
 			 VALUES (?, ?, ?, ?, ?)
-			 ON CONFLICT(level_id, kind, threshold) DO NOTHING`,
+			 ON CONFLICT(level_id, kind, threshold) WHERE kind = 'play_milestone' DO NOTHING`,
 			levelID, owner, mrPlayMilestoneKind, threshold, now,
 		); err != nil {
 			return err

@@ -157,6 +157,8 @@ Source: `manrocket_levels.go`. Public (no API key), CORS + rate-limited — same
 
 `play_count` / `completion_count` are added on existing databases by `ensureManRocketLevelPlaySchema` (`ALTER TABLE`, duplicate column ignored). Dedup rows are `manrocket_level_plays`. `sort=plays` reads `play_count` on the level row. It does not aggregate `manrocket_events`.
 
+A counted `start` that moves `play_count` across 1, 10, 100, or 500 inserts one `manrocket_level_milestones` row (`level_id`, `threshold`, `reached_at`; primary key on level + threshold) and one stub `manrocket_level_notifications` row for the level owner (`kind=play_milestone`). A retry, a later play that does not cross a new threshold, or a `complete` does not insert again. There is no notifications inbox and no FCM yet — those rows are only there so a later push does not re-fire.
+
 ## ManRocket whiteboards
 
 Public (no API key), CORS + rate-limited. Source: `manrocket_whiteboards.go`. PNGs live as BLOBs in SQLite.

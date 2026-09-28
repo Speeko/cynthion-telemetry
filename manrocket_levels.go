@@ -266,11 +266,12 @@ func (s *server) mrPlay(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	now := time.Now().UnixMilli()
 	res, err := tx.Exec(
 		`INSERT INTO manrocket_level_plays (level_id, session_id, phase, install_id, received_at)
 		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(level_id, session_id, phase) DO NOTHING`,
-		id, in.SessionID, phase, in.InstallID, time.Now().UnixMilli(),
+		id, in.SessionID, phase, in.InstallID, now,
 	)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
@@ -290,6 +291,13 @@ func (s *server) mrPlay(w http.ResponseWriter, r *http.Request, id string) {
 		if _, err := tx.Exec(`UPDATE manrocket_levels SET `+col+` = `+col+` + 1 WHERE id=?`, id); err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
+		}
+		// Milestones follow play_count only. A completion does not cross them.
+		if phase == "start" {
+			if err := recordPlayMilestones(tx, id, now); err != nil {
+				http.Error(w, "db error", http.StatusInternalServerError)
+				return
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -330,8 +338,83 @@ func (st *Store) ensureManRocketLevelPlaySchema() error {
 	)`); err != nil {
 		return err
 	}
+	if _, err := st.db.Exec(`CREATE TABLE IF NOT EXISTS manrocket_level_milestones (
+		level_id TEXT NOT NULL,
+		threshold INTEGER NOT NULL,
+		reached_at INTEGER NOT NULL,
+		PRIMARY KEY (level_id, threshold)
+	)`); err != nil {
+		return err
+	}
+	// Stub for a later inbox / FCM push. Nothing reads or sends these rows yet.
+	if _, err := st.db.Exec(`CREATE TABLE IF NOT EXISTS manrocket_level_notifications (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		level_id TEXT NOT NULL,
+		install_id TEXT NOT NULL,
+		kind TEXT NOT NULL,
+		threshold INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		UNIQUE (level_id, kind, threshold)
+	)`); err != nil {
+		return err
+	}
 	_, err := st.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mr_levels_plays ON manrocket_levels(play_count DESC, votes DESC, received_at DESC)`)
 	return err
+}
+
+// Play-count milestones. A later inbox and FCM push can consume the stub
+// notification rows; this path only persists them once.
+var mrPlayMilestoneThresholds = [...]int{1, 10, 100, 500}
+
+const mrPlayMilestoneKind = "play_milestone"
+
+// mrCrossedPlayMilestones returns thresholds in (prev, next]. Play starts
+// increment by one, so this is the single threshold equal to the new count.
+func mrCrossedPlayMilestones(prev, next int) []int {
+	var crossed []int
+	for _, threshold := range mrPlayMilestoneThresholds {
+		if prev < threshold && next >= threshold {
+			crossed = append(crossed, threshold)
+		}
+	}
+	return crossed
+}
+
+func recordPlayMilestones(tx *sql.Tx, levelID string, now int64) error {
+	var playCount int
+	var owner string
+	if err := tx.QueryRow(
+		`SELECT play_count, install_id FROM manrocket_levels WHERE id=?`, levelID,
+	).Scan(&playCount, &owner); err != nil {
+		return err
+	}
+	for _, threshold := range mrCrossedPlayMilestones(playCount-1, playCount) {
+		res, err := tx.Exec(
+			`INSERT INTO manrocket_level_milestones (level_id, threshold, reached_at)
+			 VALUES (?, ?, ?)
+			 ON CONFLICT(level_id, threshold) DO NOTHING`,
+			levelID, threshold, now,
+		)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			continue
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO manrocket_level_notifications (level_id, install_id, kind, threshold, created_at)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(level_id, kind, threshold) DO NOTHING`,
+			levelID, owner, mrPlayMilestoneKind, threshold, now,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func cleanMRName(s string, max int) string {

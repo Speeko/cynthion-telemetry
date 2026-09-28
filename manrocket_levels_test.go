@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -304,6 +305,156 @@ func TestManRocketLevelPlayMigratesOldTable(t *testing.T) {
 		`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_mr_levels_plays'`,
 	).Scan(&idx); err != nil {
 		t.Fatal(err)
+	}
+	for _, table := range []string{"manrocket_level_milestones", "manrocket_level_notifications"} {
+		var name string
+		if err := store.db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table,
+		).Scan(&name); err != nil {
+			t.Fatalf("missing %s: %v", table, err)
+		}
+	}
+}
+
+func TestCrossedPlayMilestones(t *testing.T) {
+	cases := []struct {
+		prev, next int
+		want       string
+	}{
+		{0, 1, "1"},
+		{1, 2, ""},
+		{9, 10, "10"},
+		{10, 11, ""},
+		{99, 100, "100"},
+		{499, 500, "500"},
+		{500, 501, ""},
+		{0, 100, "1,10,100"},
+		{10, 500, "100,500"},
+	}
+	for _, tc := range cases {
+		got := mrCrossedPlayMilestones(tc.prev, tc.next)
+		parts := make([]string, len(got))
+		for i, n := range got {
+			parts[i] = strconv.Itoa(n)
+		}
+		if strings.Join(parts, ",") != tc.want {
+			t.Fatalf("(%d,%d) = %v, want %q", tc.prev, tc.next, got, tc.want)
+		}
+	}
+}
+
+func TestManRocketLevelPlayMilestonesOnce(t *testing.T) {
+	s, ts := newIngestTestServer(t, testManRocketKey)
+	base := ts.URL
+	uploadMRLevel(t, base, "pad", "Pad", "owner-a")
+
+	status, _, raw := playMR(t, base, "pad", "complete", "pilot-1", "sess-c")
+	if status != http.StatusOK {
+		t.Fatalf("complete: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "pad")
+
+	status, _, raw = playMR(t, base, "pad", "start", "pilot-1", "sess-1")
+	if status != http.StatusOK {
+		t.Fatalf("first start: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "pad", 1)
+	assertMilestoneNote(t, s, "pad", 1, "owner-a")
+
+	status, _, raw = playMR(t, base, "pad", "start", "pilot-2", "sess-1")
+	if status != http.StatusOK {
+		t.Fatalf("retry: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "pad", 1)
+
+	status, _, raw = playMR(t, base, "pad", "start", "pilot-1", "sess-2")
+	if status != http.StatusOK {
+		t.Fatalf("second start: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "pad", 1)
+
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET play_count=9 WHERE id='pad'`); err != nil {
+		t.Fatal(err)
+	}
+	status, body, raw := playMR(t, base, "pad", "start", "pilot-1", "sess-10")
+	if status != http.StatusOK || body["play_count"] != float64(10) {
+		t.Fatalf("tenth: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "pad", 1, 10)
+	assertMilestoneNote(t, s, "pad", 10, "owner-a")
+
+	status, _, raw = playMR(t, base, "pad", "start", "pilot-1", "sess-11")
+	if status != http.StatusOK {
+		t.Fatalf("eleventh: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "pad", 1, 10)
+
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET play_count=99 WHERE id='pad'`); err != nil {
+		t.Fatal(err)
+	}
+	status, body, raw = playMR(t, base, "pad", "start", "pilot-1", "sess-100")
+	if status != http.StatusOK || body["play_count"] != float64(100) {
+		t.Fatalf("hundredth: %d %s", status, raw)
+	}
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET play_count=499 WHERE id='pad'`); err != nil {
+		t.Fatal(err)
+	}
+	status, body, raw = playMR(t, base, "pad", "start", "pilot-1", "sess-500")
+	if status != http.StatusOK || body["play_count"] != float64(500) {
+		t.Fatalf("five hundredth: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "pad", 1, 10, 100, 500)
+
+	// A second level does not reuse the first level's milestone rows.
+	uploadMRLevel(t, base, "other", "Other", "owner-b")
+	status, _, raw = playMR(t, base, "other", "start", "pilot-1", "sess-1")
+	if status != http.StatusOK {
+		t.Fatalf("other: %d %s", status, raw)
+	}
+	assertMilestones(t, s, "other", 1)
+	assertMilestoneNote(t, s, "other", 1, "owner-b")
+	assertMilestones(t, s, "pad", 1, 10, 100, 500)
+}
+
+func assertMilestones(t *testing.T, s *server, levelID string, want ...int) {
+	t.Helper()
+	rows, err := s.store.db.Query(
+		`SELECT threshold FROM manrocket_level_milestones WHERE level_id=? ORDER BY threshold`, levelID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []int
+	for rows.Next() {
+		var threshold int
+		if err := rows.Scan(&threshold); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, threshold)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("%s milestones = %v, want %v", levelID, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s milestones = %v, want %v", levelID, got, want)
+		}
+	}
+}
+
+func assertMilestoneNote(t *testing.T, s *server, levelID string, threshold int, owner string) {
+	t.Helper()
+	var install, kind string
+	var n int
+	if err := s.store.db.QueryRow(
+		`SELECT install_id, kind, COUNT(1) FROM manrocket_level_notifications
+		 WHERE level_id=? AND threshold=?`, levelID, threshold,
+	).Scan(&install, &kind, &n); err != nil {
+		t.Fatal(err)
+	}
+	if install != owner || kind != mrPlayMilestoneKind || n != 1 {
+		t.Fatalf("note %s/%d = %s %s n=%d", levelID, threshold, install, kind, n)
 	}
 }
 

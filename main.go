@@ -163,6 +163,8 @@ CREATE TABLE IF NOT EXISTS manrocket_levels (
 	author TEXT NOT NULL,
 	install_id TEXT NOT NULL,
 	votes INTEGER NOT NULL DEFAULT 0,
+	play_count INTEGER NOT NULL DEFAULT 0,
+	completion_count INTEGER NOT NULL DEFAULT 0,
 	payload TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS manrocket_level_votes (
@@ -222,6 +224,9 @@ func openStore(path string) (*Store, error) {
 	}
 	if err := st.ensureManRocketIngestSchema(); err != nil {
 		return nil, fmt.Errorf("manrocket ingest schema: %w", err)
+	}
+	if err := st.ensureManRocketLevelPlaySchema(); err != nil {
+		return nil, fmt.Errorf("manrocket level play schema: %w", err)
 	}
 	return st, nil
 }

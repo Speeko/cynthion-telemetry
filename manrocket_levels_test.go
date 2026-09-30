@@ -73,6 +73,15 @@ func levelIDs(t *testing.T, body map[string]any) []string {
 		if _, ok := m["completion_count"].(float64); !ok {
 			t.Fatalf("level %s missing completion_count: %#v", id, m["completion_count"])
 		}
+		if _, ok := m["loves"].(float64); !ok {
+			t.Fatalf("level %s missing loves: %#v", id, m["loves"])
+		}
+		if _, ok := m["hates"].(float64); !ok {
+			t.Fatalf("level %s missing hates: %#v", id, m["hates"])
+		}
+		if _, ok := m["starter"].(bool); !ok {
+			t.Fatalf("level %s missing starter: %#v", id, m["starter"])
+		}
 	}
 	return ids
 }
@@ -149,7 +158,7 @@ func TestManRocketLevelPlayCountsAndSort(t *testing.T) {
 	uploadMRLevel(t, base, "alpha", "Alpha 2", "owner-a")
 
 	status, got := getMR(t, base+"/v1/manrocket/levels/alpha")
-	if status != http.StatusOK || got["play_count"] != float64(2) || got["completion_count"] != float64(1) || got["votes"] != float64(0) {
+	if status != http.StatusOK || got["play_count"] != float64(2) || got["completion_count"] != float64(1) || got["votes"] != float64(0) || got["loves"] != float64(0) || got["hates"] != float64(0) || got["starter"] != false {
 		t.Fatalf("get alpha: %d %#v", status, got)
 	}
 
@@ -291,14 +300,14 @@ func TestManRocketLevelPlayMigratesOldTable(t *testing.T) {
 	}
 	t.Cleanup(func() { store.Close() })
 
-	var plays, completions, votes int
+	var plays, completions, votes, loves, hates, starter int
 	if err := store.db.QueryRow(
-		`SELECT play_count, completion_count, votes FROM manrocket_levels WHERE id='old'`,
-	).Scan(&plays, &completions, &votes); err != nil {
+		`SELECT play_count, completion_count, votes, loves, hates, starter FROM manrocket_levels WHERE id='old'`,
+	).Scan(&plays, &completions, &votes, &loves, &hates, &starter); err != nil {
 		t.Fatal(err)
 	}
-	if plays != 0 || completions != 0 || votes != 3 {
-		t.Fatalf("migrated row = plays %d completions %d votes %d", plays, completions, votes)
+	if plays != 0 || completions != 0 || votes != 3 || loves != 0 || hates != 0 || starter != 0 {
+		t.Fatalf("migrated row = plays %d completions %d votes %d loves %d hates %d starter %d", plays, completions, votes, loves, hates, starter)
 	}
 	var idx string
 	if err := store.db.QueryRow(
@@ -313,6 +322,454 @@ func TestManRocketLevelPlayMigratesOldTable(t *testing.T) {
 		).Scan(&name); err != nil {
 			t.Fatalf("missing %s: %v", table, err)
 		}
+	}
+}
+
+func voteMR(t *testing.T, base, id, install string, value int) (int, []byte) {
+	t.Helper()
+	return postJSON(t, base+"/v1/manrocket/levels/"+id+"/vote", "", map[string]any{
+		"install_id": install, "value": value,
+	})
+}
+
+func levelCounts(t *testing.T, m map[string]any) (votes, loves, hates int) {
+	t.Helper()
+	vf, ok1 := m["votes"].(float64)
+	lf, ok2 := m["loves"].(float64)
+	hf, ok3 := m["hates"].(float64)
+	if !ok1 || !ok2 || !ok3 {
+		t.Fatalf("counts %#v", m)
+	}
+	return int(vf), int(lf), int(hf)
+}
+
+func assertLevelCounts(t *testing.T, base, id string, votes, loves, hates int) {
+	t.Helper()
+	status, got := getMR(t, base+"/v1/manrocket/levels/"+id)
+	if status != http.StatusOK {
+		t.Fatalf("get %s: %d %#v", id, status, got)
+	}
+	gv, gl, gh := levelCounts(t, got)
+	if gv != votes || gl != loves || gh != hates {
+		t.Fatalf("%s counts = votes %d loves %d hates %d, want %d %d %d", id, gv, gl, gh, votes, loves, hates)
+	}
+}
+
+func TestManRocketLevelLoveHate(t *testing.T) {
+	s, ts := newIngestTestServer(t, testManRocketKey)
+	base := ts.URL
+	uploadMRLevel(t, base, "a", "A", "owner-a")
+	uploadMRLevel(t, base, "b", "B", "owner-b")
+	uploadMRLevel(t, base, "c", "C", "owner-c")
+	uploadMRLevel(t, base, "note", "Note", "owner-n")
+	for _, spec := range []struct {
+		id   string
+		when int64
+	}{
+		{"a", 1000},
+		{"b", 2000},
+		{"c", 3000},
+		{"note", 4000},
+	} {
+		if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET received_at=? WHERE id=?`, spec.when, spec.id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// ±1 moves votes only. Love and hate replace that vote without folding in.
+	status, raw := voteMR(t, base, "note", "p1", 1)
+	if status != http.StatusOK {
+		t.Fatalf("like: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 1, 0, 0)
+	if countNotifs(t, s, "owner-n", notifVoteOnLevel) != 1 {
+		t.Fatalf("like notifications=%d", countNotifs(t, s, "owner-n", notifVoteOnLevel))
+	}
+	status, raw = voteMR(t, base, "note", "p1", -1)
+	if status != http.StatusOK {
+		t.Fatalf("dislike: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", -1, 0, 0)
+	status, raw = voteMR(t, base, "note", "p1", 1)
+	if status != http.StatusOK {
+		t.Fatalf("relike: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 1, 0, 0)
+	if countNotifs(t, s, "owner-n", notifVoteOnLevel) != 1 {
+		t.Fatalf("relike stacked notifications")
+	}
+	status, raw = voteMR(t, base, "note", "p1", 2)
+	if status != http.StatusOK {
+		t.Fatalf("love: %d %s", status, raw)
+	}
+	var voteBody struct {
+		OK    bool `json:"ok"`
+		Votes int  `json:"votes"`
+	}
+	if err := json.Unmarshal(raw, &voteBody); err != nil || !voteBody.OK || voteBody.Votes != 0 {
+		t.Fatalf("love response: %s", raw)
+	}
+	assertLevelCounts(t, base, "note", 0, 1, 0)
+	status, raw = voteMR(t, base, "note", "p1", 2)
+	if status != http.StatusOK {
+		t.Fatalf("repeat love: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 0, 1, 0)
+	if countNotifs(t, s, "owner-n", notifVoteOnLevel) != 1 {
+		t.Fatalf("love after like stacked notifications")
+	}
+	status, raw = voteMR(t, base, "note", "p1", -2)
+	if status != http.StatusOK {
+		t.Fatalf("hate: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 0, 0, 1)
+	status, raw = voteMR(t, base, "note", "p1", 2)
+	if status != http.StatusOK {
+		t.Fatalf("love again: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 0, 1, 0)
+	status, raw = voteMR(t, base, "note", "p1", 1)
+	if status != http.StatusOK {
+		t.Fatalf("back to like: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 1, 0, 0)
+	if countNotifs(t, s, "owner-n", notifVoteOnLevel) != 1 {
+		t.Fatalf("notifications after flips=%d", countNotifs(t, s, "owner-n", notifVoteOnLevel))
+	}
+
+	status, raw = voteMR(t, base, "note", "p2", -2)
+	if status != http.StatusOK {
+		t.Fatalf("p2 hate: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 1, 0, 1)
+	if countNotifs(t, s, "owner-n", notifVoteOnLevel) != 1 {
+		t.Fatal("hate wrote a notification")
+	}
+	status, raw = voteMR(t, base, "note", "p2", 2)
+	if status != http.StatusOK {
+		t.Fatalf("p2 love: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 1, 1, 0)
+	if countNotifs(t, s, "owner-n", notifVoteOnLevel) != 2 {
+		t.Fatalf("first love notifications=%d", countNotifs(t, s, "owner-n", notifVoteOnLevel))
+	}
+	status, raw = voteMR(t, base, "note", "owner-n", 2)
+	if status != http.StatusOK {
+		t.Fatalf("self love: %d %s", status, raw)
+	}
+	assertLevelCounts(t, base, "note", 1, 2, 0)
+	if countNotifs(t, s, "owner-n", notifVoteOnLevel) != 2 {
+		t.Fatal("self-love wrote a notification")
+	}
+
+	for _, value := range []int{0, 3, -3} {
+		status, raw = voteMR(t, base, "note", "p1", value)
+		if status != http.StatusBadRequest || !strings.Contains(string(raw), "bad value") {
+			t.Fatalf("value %d: %d %s", value, status, raw)
+		}
+	}
+	assertLevelCounts(t, base, "note", 1, 2, 0)
+	var rows int
+	var stored int
+	if err := s.store.db.QueryRow(
+		`SELECT COUNT(1), MAX(value) FROM manrocket_level_votes WHERE level_id='note' AND install_id='p1'`,
+	).Scan(&rows, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 || stored != 1 {
+		t.Fatalf("p1 vote row = count %d value %d", rows, stored)
+	}
+
+	// Sort fixtures. Loves stay out of votes: a has two loves and votes 0.
+	for _, spec := range []struct {
+		id, install string
+		value       int
+	}{
+		{"a", "p1", 2},
+		{"a", "p2", 2},
+		{"a", "p3", -2},
+		{"b", "p1", 1},
+		{"b", "p2", 1},
+		{"c", "p1", -2},
+		{"c", "p2", -2},
+		{"c", "p3", -1},
+	} {
+		status, raw = voteMR(t, base, spec.id, spec.install, spec.value)
+		if status != http.StatusOK {
+			t.Fatalf("vote %s %s %d: %d %s", spec.id, spec.install, spec.value, status, raw)
+		}
+	}
+	assertLevelCounts(t, base, "a", 0, 2, 1)
+	assertLevelCounts(t, base, "b", 2, 0, 0)
+	assertLevelCounts(t, base, "c", -1, 0, 2)
+	if countNotifs(t, s, "owner-a", notifVoteOnLevel) != 2 {
+		t.Fatalf("a love notifications=%d", countNotifs(t, s, "owner-a", notifVoteOnLevel))
+	}
+	if countNotifs(t, s, "owner-c", notifVoteOnLevel) != 0 {
+		t.Fatal("hate level wrote a notification")
+	}
+
+	_, love := getMR(t, base+"/v1/manrocket/levels?sort=love")
+	if ids := levelIDs(t, love); strings.Join(ids, ",") != "note,a,c,b" {
+		t.Fatalf("sort=love: %v", ids)
+	}
+	_, hate := getMR(t, base+"/v1/manrocket/levels?sort=hate")
+	if ids := levelIDs(t, hate); strings.Join(ids, ",") != "c,a,note,b" {
+		t.Fatalf("sort=hate: %v", ids)
+	}
+	_, top := getMR(t, base+"/v1/manrocket/levels?sort=top")
+	_, other := getMR(t, base+"/v1/manrocket/levels?sort=nope")
+	for _, spec := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"top", top},
+		{"unknown", other},
+	} {
+		if ids := levelIDs(t, spec.body); strings.Join(ids, ",") != "b,note,a,c" {
+			t.Fatalf("sort %s: %v", spec.name, ids)
+		}
+	}
+	rawLevels, _ := love["levels"].([]any)
+	for _, item := range rawLevels {
+		m := item.(map[string]any)
+		if m["id"] == "a" {
+			if m["votes"] != float64(0) || m["loves"] != float64(2) || m["hates"] != float64(1) || m["starter"] != false {
+				t.Fatalf("list a: %#v", m)
+			}
+		}
+	}
+}
+
+func TestManRocketLevelLoveHateMigratesOldVotes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE manrocket_levels (
+		id TEXT PRIMARY KEY,
+		received_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		author TEXT NOT NULL,
+		install_id TEXT NOT NULL,
+		votes INTEGER NOT NULL DEFAULT 0,
+		payload TEXT NOT NULL
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE manrocket_level_votes (
+		level_id TEXT NOT NULL,
+		install_id TEXT NOT NULL,
+		value INTEGER NOT NULL,
+		PRIMARY KEY (level_id, install_id)
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO manrocket_levels
+		(id, received_at, updated_at, title, author, install_id, votes, payload)
+		VALUES ('old', 1, 1, 'Old', 'ada', 'inst-1', 1, '{"id":"old"}')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO manrocket_level_votes (level_id, install_id, value) VALUES
+		('old', 'a', 1),
+		('old', 'b', 2),
+		('old', 'c', -2),
+		('old', 'd', 2)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := openStore(path)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	var votes, loves, hates, starter int
+	if err := store.db.QueryRow(
+		`SELECT votes, loves, hates, starter FROM manrocket_levels WHERE id='old'`,
+	).Scan(&votes, &loves, &hates, &starter); err != nil {
+		t.Fatal(err)
+	}
+	if votes != 1 || loves != 2 || hates != 1 || starter != 0 {
+		t.Fatalf("backfill = votes %d loves %d hates %d starter %d", votes, loves, hates, starter)
+	}
+	for _, idx := range []string{"idx_mr_levels_loves", "idx_mr_levels_hates"} {
+		var name string
+		if err := store.db.QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='index' AND name=?`, idx,
+		).Scan(&name); err != nil {
+			t.Fatalf("missing %s: %v", idx, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = openStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	if err := store.db.QueryRow(
+		`SELECT votes, loves, hates, starter FROM manrocket_levels WHERE id='old'`,
+	).Scan(&votes, &loves, &hates, &starter); err != nil {
+		t.Fatal(err)
+	}
+	if votes != 1 || loves != 2 || hates != 1 || starter != 0 {
+		t.Fatalf("reopen = votes %d loves %d hates %d starter %d", votes, loves, hates, starter)
+	}
+}
+
+func TestManRocketLevelStarterSort(t *testing.T) {
+	s, ts := newIngestTestServer(t, testManRocketKey)
+	base := ts.URL
+	uploadMRLevel(t, base, "alpha", "Alpha", "owner-a")
+	uploadMRLevel(t, base, "beta", "Beta", "owner-b")
+	uploadMRLevel(t, base, "gamma", "Gamma", "owner-c")
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET received_at=? WHERE id=?`, 1000, "alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET received_at=? WHERE id=?`, 3000, "beta"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET received_at=?, starter=1 WHERE id=?`, 2000, "gamma"); err != nil {
+		t.Fatal(err)
+	}
+	// beta would lead every non-starter sort. gamma is starter and otherwise last.
+	for i := 0; i < 2; i++ {
+		status, raw := voteMR(t, base, "beta", "v"+strconv.Itoa(i), 1)
+		if status != http.StatusOK {
+			t.Fatalf("like: %d %s", status, raw)
+		}
+		status, raw = voteMR(t, base, "beta", "l"+strconv.Itoa(i), 2)
+		if status != http.StatusOK {
+			t.Fatalf("love: %d %s", status, raw)
+		}
+		status, raw = voteMR(t, base, "beta", "h"+strconv.Itoa(i), -2)
+		if status != http.StatusOK {
+			t.Fatalf("hate: %d %s", status, raw)
+		}
+	}
+	status, _, raw := playMR(t, base, "beta", "start", "pilot-1", "sess-b")
+	if status != http.StatusOK {
+		t.Fatalf("play: %d %s", status, raw)
+	}
+
+	want := "gamma,beta,alpha"
+	for _, sort := range []string{"top", "new", "plays", "love", "hate", "nope", ""} {
+		url := base + "/v1/manrocket/levels"
+		if sort != "" {
+			url += "?sort=" + sort
+		}
+		_, body := getMR(t, url)
+		if ids := levelIDs(t, body); strings.Join(ids, ",") != want {
+			t.Fatalf("sort %q: %v", sort, ids)
+		}
+		for _, item := range body["levels"].([]any) {
+			m := item.(map[string]any)
+			starter, ok := m["starter"].(bool)
+			if !ok {
+				t.Fatalf("starter type: %#v", m["starter"])
+			}
+			if m["id"] == "gamma" && !starter {
+				t.Fatalf("gamma starter: %#v", m["starter"])
+			}
+			if m["id"] != "gamma" && starter {
+				t.Fatalf("%s starter: %#v", m["id"], m["starter"])
+			}
+		}
+	}
+
+	status, got := getMR(t, base+"/v1/manrocket/levels/gamma")
+	if status != http.StatusOK || got["starter"] != true {
+		t.Fatalf("get gamma: %d %#v", status, got)
+	}
+	status, got = getMR(t, base+"/v1/manrocket/levels/alpha")
+	if status != http.StatusOK || got["starter"] != false {
+		t.Fatalf("get alpha: %d %#v", status, got)
+	}
+	var starters int
+	if err := s.store.db.QueryRow(`SELECT COUNT(1) FROM manrocket_levels WHERE starter!=0`).Scan(&starters); err != nil {
+		t.Fatal(err)
+	}
+	if starters != 1 {
+		t.Fatalf("starter rows=%d", starters)
+	}
+	var learn int
+	if err := s.store.db.QueryRow(`SELECT COUNT(1) FROM manrocket_levels WHERE id='learn-to-fly'`).Scan(&learn); err != nil {
+		t.Fatal(err)
+	}
+	if learn != 0 {
+		t.Fatal("learn-to-fly was inserted")
+	}
+}
+
+func TestManRocketLevelOwnerReuploadKeepsStarter(t *testing.T) {
+	s, ts := newIngestTestServer(t, testManRocketKey)
+	base := ts.URL
+	const owner = "1790587088-377868843"
+	uploadMRLevel(t, base, "pad", "Pad", owner)
+	if _, err := s.store.db.Exec(`UPDATE manrocket_levels SET starter=1 WHERE id='pad'`); err != nil {
+		t.Fatal(err)
+	}
+	status, raw := voteMR(t, base, "pad", "pilot-b", 2)
+	if status != http.StatusOK {
+		t.Fatalf("love: %d %s", status, raw)
+	}
+	status, raw = voteMR(t, base, "pad", "pilot-c", 1)
+	if status != http.StatusOK {
+		t.Fatalf("like: %d %s", status, raw)
+	}
+
+	status, raw = postJSON(t, base+"/v1/manrocket/levels", "", map[string]any{
+		"id": "pad", "title": "Pad 2", "author": "ada", "install_id": owner,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("owner reupload: %d %s", status, raw)
+	}
+	_, list := getMR(t, base+"/v1/manrocket/levels?sort=new")
+	found := false
+	for _, item := range list["levels"].([]any) {
+		m := item.(map[string]any)
+		if m["id"] != "pad" {
+			continue
+		}
+		found = true
+		if m["title"] != "Pad 2" || m["starter"] != true || m["votes"] != float64(1) || m["loves"] != float64(1) || m["hates"] != float64(0) {
+			t.Fatalf("after owner reupload: %#v", m)
+		}
+	}
+	if !found {
+		t.Fatal("pad missing after reupload")
+	}
+
+	status, raw = postJSON(t, base+"/v1/manrocket/levels", "", map[string]any{
+		"id": "pad", "title": "Stolen", "author": "ada", "install_id": "someone-else",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("other install: %d %s", status, raw)
+	}
+	_, list = getMR(t, base+"/v1/manrocket/levels?sort=new")
+	for _, item := range list["levels"].([]any) {
+		m := item.(map[string]any)
+		if m["id"] == "pad" && (m["title"] != "Pad 2" || m["starter"] != true) {
+			t.Fatalf("other install changed the row: %#v", m)
+		}
+	}
+	var storedOwner string
+	if err := s.store.db.QueryRow(`SELECT install_id FROM manrocket_levels WHERE id='pad'`).Scan(&storedOwner); err != nil {
+		t.Fatal(err)
+	}
+	if storedOwner != owner {
+		t.Fatalf("owner = %s", storedOwner)
 	}
 }
 

@@ -74,6 +74,10 @@ func (s *server) mrUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UnixMilli()
+	// Same install_id may replace title, author, and payload. A different
+	// install_id leaves the row unchanged: the conflict WHERE fails and this
+	// handler still returns ok. Votes, loves, hates, play counts, and starter
+	// are omitted from the update, so a reupload does not clear them.
 	_, err = s.store.db.Exec(
 		`INSERT INTO manrocket_levels (id, received_at, updated_at, title, author, install_id, votes, payload)
 		 VALUES (?, ?, ?, ?, ?, ?, 0, ?)
@@ -111,15 +115,21 @@ func (s *server) mrList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// sort is a closed set. Anything else stays on the historical default (votes).
+	// starter DESC leads every sort, including that default, so a flagged row
+	// stays ahead of the requested key.
 	order := "votes DESC, received_at DESC"
 	switch sort {
 	case "new":
 		order = "received_at DESC"
 	case "plays":
 		order = "play_count DESC, votes DESC, received_at DESC"
+	case "love":
+		order = "loves DESC, received_at DESC"
+	case "hate":
+		order = "hates DESC, received_at DESC"
 	}
-	q := `SELECT id, title, author, votes, play_count, completion_count, payload, received_at
-		FROM manrocket_levels ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+	q := `SELECT id, title, author, votes, loves, hates, play_count, completion_count, starter, payload, received_at
+		FROM manrocket_levels ORDER BY starter DESC, ` + order + ` LIMIT ? OFFSET ?`
 	rows, err := s.store.db.Query(q, limit, offset)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
@@ -129,9 +139,9 @@ func (s *server) mrList(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var id, title, author, payload string
-		var votes, playCount, completionCount int
+		var votes, loves, hates, playCount, completionCount, starter int
 		var received int64
-		if err := rows.Scan(&id, &title, &author, &votes, &playCount, &completionCount, &payload, &received); err != nil {
+		if err := rows.Scan(&id, &title, &author, &votes, &loves, &hates, &playCount, &completionCount, &starter, &payload, &received); err != nil {
 			http.Error(w, "db error", http.StatusInternalServerError)
 			return
 		}
@@ -139,7 +149,9 @@ func (s *server) mrList(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal([]byte(payload), &level)
 		out = append(out, map[string]any{
 			"id": id, "title": title, "author": author, "votes": votes,
+			"loves": loves, "hates": hates,
 			"play_count": playCount, "completion_count": completionCount,
+			"starter":     starter != 0,
 			"received_at": received, "level": level,
 		})
 	}
@@ -149,10 +161,10 @@ func (s *server) mrList(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) mrGet(w http.ResponseWriter, r *http.Request, id string) {
 	var payload string
-	var votes, playCount, completionCount int
+	var votes, loves, hates, playCount, completionCount, starter int
 	err := s.store.db.QueryRow(
-		`SELECT payload, votes, play_count, completion_count FROM manrocket_levels WHERE id=?`, id,
-	).Scan(&payload, &votes, &playCount, &completionCount)
+		`SELECT payload, votes, loves, hates, play_count, completion_count, starter FROM manrocket_levels WHERE id=?`, id,
+	).Scan(&payload, &votes, &loves, &hates, &playCount, &completionCount, &starter)
 	if err == sql.ErrNoRows {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
@@ -165,8 +177,27 @@ func (s *server) mrGet(w http.ResponseWriter, r *http.Request, id string) {
 	_ = json.Unmarshal([]byte(payload), &level)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"ok": true, "votes": votes, "play_count": playCount, "completion_count": completionCount, "level": level,
+		"ok": true, "votes": votes, "loves": loves, "hates": hates,
+		"play_count": playCount, "completion_count": completionCount,
+		"starter": starter != 0, "level": level,
 	})
+}
+
+// mrVoteTally is how one stored vote contributes to the denormalized counters.
+// votes is the net of +1/-1 only. Love (2) and hate (-2) are separate counts.
+func mrVoteTally(value int) (votes, loves, hates int) {
+	switch value {
+	case 1:
+		return 1, 0, 0
+	case -1:
+		return -1, 0, 0
+	case 2:
+		return 0, 1, 0
+	case -2:
+		return 0, 0, 1
+	default:
+		return 0, 0, 0
+	}
 }
 
 func (s *server) mrVote(w http.ResponseWriter, r *http.Request, id string) {
@@ -184,7 +215,7 @@ func (s *server) mrVote(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "bad install_id", http.StatusBadRequest)
 		return
 	}
-	if in.Value != 1 && in.Value != -1 {
+	if in.Value != 1 && in.Value != -1 && in.Value != 2 && in.Value != -2 {
 		http.Error(w, "bad value", http.StatusBadRequest)
 		return
 	}
@@ -201,10 +232,11 @@ func (s *server) mrVote(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	var prev sql.NullInt64
 	_ = tx.QueryRow(`SELECT value FROM manrocket_level_votes WHERE level_id=? AND install_id=?`, id, in.InstallID).Scan(&prev)
-	delta := in.Value
+	prevVotes, prevLoves, prevHates := 0, 0, 0
 	if prev.Valid {
-		delta = in.Value - int(prev.Int64)
+		prevVotes, prevLoves, prevHates = mrVoteTally(int(prev.Int64))
 	}
+	nextVotes, nextLoves, nextHates := mrVoteTally(in.Value)
 	if _, err := tx.Exec(
 		`INSERT INTO manrocket_level_votes (level_id, install_id, value) VALUES (?,?,?)
 		 ON CONFLICT(level_id, install_id) DO UPDATE SET value=excluded.value`,
@@ -213,7 +245,10 @@ func (s *server) mrVote(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
-	if _, err := tx.Exec(`UPDATE manrocket_levels SET votes = votes + ? WHERE id=?`, delta, id); err != nil {
+	if _, err := tx.Exec(
+		`UPDATE manrocket_levels SET votes = votes + ?, loves = loves + ?, hates = hates + ? WHERE id=?`,
+		nextVotes-prevVotes, nextLoves-prevLoves, nextHates-prevHates, id,
+	); err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
@@ -221,9 +256,10 @@ func (s *server) mrVote(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "db error", http.StatusInternalServerError)
 		return
 	}
-	// Likes are this vote. A transition to +1 notifies the level owner once
-	// per voter (see notifyVoteOnLevel). The vote response stays {ok, votes}.
-	if in.Value == 1 && (!prev.Valid || prev.Int64 != 1) {
+	// A transition to +1 (like) or 2 (love) notifies the level owner once per
+	// voter (see notifyVoteOnLevel). Hate and dislike do not. The vote
+	// response stays {ok, votes}.
+	if (in.Value == 1 || in.Value == 2) && (!prev.Valid || prev.Int64 != int64(in.Value)) {
 		s.notifyVoteOnLevel(id, in.InstallID)
 	}
 	var votes int
@@ -369,6 +405,48 @@ func (st *Store) ensureManRocketLevelPlaySchema() error {
 	}
 	_, err := st.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mr_levels_plays ON manrocket_levels(play_count DESC, votes DESC, received_at DESC)`)
 	return err
+}
+
+// ensureManRocketLevelLoveHateSchema adds denormalized love/hate counts to
+// levels that predate them. Indexes are created here, after the columns
+// exist — the schema string runs first and must not reference loves or hates
+// on an old database. The first time a column is added, counts are filled
+// from manrocket_level_votes. Later votes maintain the columns in mrVote so
+// list sort does not scan the votes table.
+func (st *Store) ensureManRocketLevelLoveHateSchema() error {
+	added := false
+	for _, col := range []string{"loves", "hates"} {
+		q := `ALTER TABLE manrocket_levels ADD COLUMN ` + col + ` INTEGER NOT NULL DEFAULT 0`
+		if _, err := st.db.Exec(q); err != nil {
+			if strings.Contains(err.Error(), "duplicate column") {
+				continue
+			}
+			return err
+		}
+		added = true
+	}
+	if added {
+		if _, err := st.db.Exec(`UPDATE manrocket_levels SET
+			loves = (SELECT COUNT(*) FROM manrocket_level_votes WHERE level_id = manrocket_levels.id AND value = 2),
+			hates = (SELECT COUNT(*) FROM manrocket_level_votes WHERE level_id = manrocket_levels.id AND value = -2)`); err != nil {
+			return err
+		}
+	}
+	if _, err := st.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mr_levels_loves ON manrocket_levels(loves DESC, received_at DESC)`); err != nil {
+		return err
+	}
+	_, err := st.db.Exec(`CREATE INDEX IF NOT EXISTS idx_mr_levels_hates ON manrocket_levels(hates DESC, received_at DESC)`)
+	return err
+}
+
+// ensureManRocketLevelStarterSchema adds the builtin-first-level flag.
+// Existing rows stay false. This migration does not insert a level.
+func (st *Store) ensureManRocketLevelStarterSchema() error {
+	_, err := st.db.Exec(`ALTER TABLE manrocket_levels ADD COLUMN starter INTEGER NOT NULL DEFAULT 0`)
+	if err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return err
+	}
+	return nil
 }
 
 // Play-count milestones. The inbox lists these rows; FCM push is still later.

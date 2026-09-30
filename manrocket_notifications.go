@@ -328,8 +328,10 @@ func insertManRocketNotification(tx *sql.Tx, recipient, kind, actor, levelID str
 }
 
 // notifyVoteOnLevel writes vote_on_your_level the first time actor likes
-// a level they do not own. The partial unique index drops repeats. Failures
-// are logged; the vote itself has already committed.
+// (+1) or loves (2) a level they do not own. The partial unique index drops
+// repeats, so a later love after a like (or the reverse) does not add a
+// second row. Hate and dislike never call this. Failures are logged; the
+// vote itself has already committed.
 func (s *server) notifyVoteOnLevel(levelID, actor string) {
 	var owner string
 	if err := s.store.db.QueryRow(`SELECT install_id FROM manrocket_levels WHERE id=?`, levelID).Scan(&owner); err != nil {

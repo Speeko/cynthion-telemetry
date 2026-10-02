@@ -30,6 +30,10 @@ func (s *server) manrocketLevels(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSuffix(path, "/play")
 		id = strings.Trim(id, "/")
 		s.mrPlay(w, r, id)
+	case strings.HasSuffix(path, "/delete") && r.Method == http.MethodPost:
+		id := strings.TrimSuffix(path, "/delete")
+		id = strings.Trim(id, "/")
+		s.mrDelete(w, r, id)
 	case isLevelCommentsPath(path):
 		s.mrComments(w, r, path)
 	case path != "" && r.Method == http.MethodGet:
@@ -359,6 +363,67 @@ func (s *server) mrPlay(w http.ResponseWriter, r *http.Request, id string) {
 		"ok": true, "play_count": playCount, "completion_count": completionCount, "counted": counted,
 	})
 }
+
+func (s *server) mrDelete(w http.ResponseWriter, r *http.Request, id string) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<14)
+	var in struct {
+		InstallID string `json:"install_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	in.InstallID = strings.TrimSpace(in.InstallID)
+	if in.InstallID == "" || len(in.InstallID) > 64 {
+		http.Error(w, "bad install_id", http.StatusBadRequest)
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" || len(id) > 80 || strings.Contains(id, "/") {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	tx, err := s.store.db.Begin()
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	var owner string
+	err = tx.QueryRow(`SELECT install_id FROM manrocket_levels WHERE id=?`, id).Scan(&owner)
+	if err == sql.ErrNoRows {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	if owner != in.InstallID {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	for _, q := range []string{
+		`DELETE FROM manrocket_level_votes WHERE level_id=?`,
+		`DELETE FROM manrocket_level_plays WHERE level_id=?`,
+		`DELETE FROM manrocket_level_comments WHERE level_id=?`,
+		`DELETE FROM manrocket_level_milestones WHERE level_id=?`,
+		`DELETE FROM manrocket_level_notifications WHERE level_id=?`,
+		`DELETE FROM manrocket_levels WHERE id=?`,
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
+}
+
 
 // ensureManRocketLevelPlaySchema adds denormalized play counters to levels
 // that predate them, plus the idempotency table. The plays index is created

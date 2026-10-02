@@ -947,3 +947,72 @@ func TestManRocketCourseBoardUnaffectedByPlays(t *testing.T) {
 		t.Fatalf("entries: %#v", board["entries"])
 	}
 }
+
+func TestManRocketLevelDelete(t *testing.T) {
+	s, ts := newIngestTestServer(t, testManRocketKey)
+	base := ts.URL
+	uploadMRLevel(t, base, "alpha", "Alpha", "owner-a")
+	if st, raw := postJSON(t, base+"/v1/manrocket/levels/alpha/vote", "", map[string]any{"install_id": "voter", "value": 1}); st != http.StatusOK {
+		t.Fatalf("vote: %d %s", st, raw)
+	}
+	if st, _, raw := playMR(t, base, "alpha", "start", "player", "sess-1"); st != http.StatusOK {
+		t.Fatalf("play: %d %s", st, raw)
+	}
+	if _, err := s.store.db.Exec(`INSERT INTO manrocket_level_comments (level_id, install_id, author, body, created_at, updated_at, ip) VALUES (?,?,?,?,?,?,?)`,
+		"alpha", "commenter", "ada", "hi", 1, 1, "127.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.db.Exec(`INSERT INTO manrocket_level_milestones (level_id, threshold, reached_at) VALUES (?,?,?)`, "alpha", 99999, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.store.db.Exec(`INSERT INTO manrocket_level_notifications (level_id, install_id, kind, threshold, created_at) VALUES (?,?,?,?,?)`,
+		"alpha", "owner-a", "play_milestone", 99999, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	status, raw := postJSON(t, base+"/v1/manrocket/levels/missing/delete", "", map[string]any{"install_id": "owner-a"})
+	if status != http.StatusNotFound || !strings.Contains(string(raw), "not found") {
+		t.Fatalf("missing: %d %s", status, raw)
+	}
+	status, raw = postJSON(t, base+"/v1/manrocket/levels/alpha/delete", "", map[string]any{"install_id": "owner-b"})
+	if status != http.StatusForbidden || !strings.Contains(string(raw), "forbidden") {
+		t.Fatalf("wrong owner: %d %s", status, raw)
+	}
+	resp, err := http.Get(base + "/v1/manrocket/levels/alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("level removed early: %d", resp.StatusCode)
+	}
+	status, raw = postJSON(t, base+"/v1/manrocket/levels/alpha/delete", "", map[string]any{"install_id": "owner-a"})
+	if status != http.StatusOK || !strings.Contains(string(raw), `"ok":true`) {
+		t.Fatalf("delete: %d %s", status, raw)
+	}
+	resp, err = http.Get(base + "/v1/manrocket/levels/alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("after delete: %d %s", resp.StatusCode, gone)
+	}
+	for _, q := range []string{
+		`SELECT COUNT(1) FROM manrocket_level_votes WHERE level_id='alpha'`,
+		`SELECT COUNT(1) FROM manrocket_level_plays WHERE level_id='alpha'`,
+		`SELECT COUNT(1) FROM manrocket_level_comments WHERE level_id='alpha'`,
+		`SELECT COUNT(1) FROM manrocket_level_milestones WHERE level_id='alpha'`,
+		`SELECT COUNT(1) FROM manrocket_level_notifications WHERE level_id='alpha'`,
+		`SELECT COUNT(1) FROM manrocket_levels WHERE id='alpha'`,
+	} {
+		var n int
+		if err := s.store.db.QueryRow(q).Scan(&n); err != nil {
+			t.Fatal(q, err)
+		}
+		if n != 0 {
+			t.Fatalf("%s = %d", q, n)
+		}
+	}
+}

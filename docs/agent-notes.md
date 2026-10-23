@@ -12,14 +12,16 @@ No secrets here. Keys live only in the droplet `.env` (root, 600) and on Brett's
 
 Rollback: restore code from the previous main commit + `.env.bak-<ts>` (or `docker tag` the pre-image back to latest), `docker compose up -d`.
 
-Caution: the in-place Go build can starve the small droplet (2026-10-23 it hung during a rebuild). Prefer building off-box if that repeats.
+Droplet is s-1vcpu-2gb (2 GB RAM, no swap) since 2026-10-23. On the old size the in-place Go build hung the box; on 2 GB the build dips to ~950 MB available. Run the build detached (`nohup ... docker compose up -d --build > /root/build.log`) so an SSH drop doesn't matter.
 
 ## Facts
 - `received_at` is unix milliseconds in every table.
 - Pre-existing: `TestLevelCommentsCRUDInbox` fails on main (404); gofmt flags manrocket_levels.go.
 - Game ingest: `/v1/manrocket/{events,crash,bugreport}` and `/v1/launchlaser1/{events,crash}` share `withIngestCORS` (itch origins), per-IP rate limit, comma-separated key lists, event_type `^[a-z0-9_.:-]{1,64}$`, 8 KB payload per event, daily caps per UTC day (in memory, reset on restart).
-- LL1-TEL-2: launchlaser1_* rows older than 24 months are purged at startup and daily.
+- LL1-TEL-2: launchlaser1_* rows older than 24 months are purged at startup and daily (log line `launchlaser1 retention purge`).
+- Container logs (they hold client IPs) rotate via compose: json-file, 10m x 5.
 
 ## Log
 - 2026-10-23: deployed 4255883 (ManRocket ingest CORS + Launch Laser 1 ingest). Smoke install_ids: smoke-homelab-cors (ManRocket), smoke-homelab-ll1 (LL1).
-- 2026-10-23: merged hardening (3b57a23) and LL1 retention (e65dbad). Deploy interrupted by droplet hang; see Homelab NOTES.md.
+- 2026-10-23: merged hardening (3b57a23) and LL1 retention (e65dbad). First deploy attempt hung the droplet; Brett power-cycled and resized to 2 GB.
+- 2026-10-23 12:27 AWST: deployed main 1003d95 (hardening + LL1-TEL-2 + log rotation). Backup events.db.bak-20261023-122524-prehardening2; rollback image cynthion-telemetry:pre-hardening-4255883. Smoke install_id smoke-homelab-hardening. Purge ran at boot, deleted 0/0.

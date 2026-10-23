@@ -6,6 +6,9 @@
 // ManRocket is game-scoped on POST /v1/manrocket/events, /v1/manrocket/crash,
 // and /v1/manrocket/bugreport (MANROCKET_INGEST_API_KEY, manrocket_* tables).
 // See manrocket_ingest.go. Public ManRocket community routes are separate.
+// Launch Laser 1 is game-scoped on POST /v1/launchlaser1/events and
+// /v1/launchlaser1/crash (LAUNCHLASER1_INGEST_API_KEY, launchlaser1_* tables).
+// See launchlaser1_ingest.go.
 // Plus a /health probe.
 // SQLite storage (modernc.org/sqlite — pure Go, no CGO).
 // Auth: X-API-Key header.
@@ -49,18 +52,20 @@ const (
 )
 
 type Config struct {
-	Listen          string
-	APIKey          string
-	ManRocketAPIKey string
-	DBPath          string
+	Listen             string
+	APIKey             string
+	ManRocketAPIKey    string
+	LaunchLaser1APIKey string
+	DBPath             string
 }
 
 func loadConfig() Config {
 	c := Config{
-		Listen:          envOr("LISTEN_ADDR", ":8090"),
-		APIKey:          os.Getenv("INGEST_API_KEY"),
-		ManRocketAPIKey: os.Getenv("MANROCKET_INGEST_API_KEY"),
-		DBPath:          envOr("DB_PATH", "/data/events.db"),
+		Listen:             envOr("LISTEN_ADDR", ":8090"),
+		APIKey:             os.Getenv("INGEST_API_KEY"),
+		ManRocketAPIKey:    os.Getenv("MANROCKET_INGEST_API_KEY"),
+		LaunchLaser1APIKey: os.Getenv("LAUNCHLASER1_INGEST_API_KEY"),
+		DBPath:             envOr("DB_PATH", "/data/events.db"),
 	}
 	if c.APIKey == "" {
 		log.Fatal("INGEST_API_KEY env var is required")
@@ -74,6 +79,11 @@ func loadConfig() Config {
 		log.Print("MANROCKET_INGEST_API_KEY unset or shorter than 24 characters; POST /v1/manrocket/events, /v1/manrocket/crash, and /v1/manrocket/bugreport will return 401")
 	} else {
 		log.Print("manrocket ingest auth enabled (MANROCKET_INGEST_API_KEY)")
+	}
+	if len(c.LaunchLaser1APIKey) < 24 {
+		log.Print("LAUNCHLASER1_INGEST_API_KEY unset or shorter than 24 characters; POST /v1/launchlaser1/events and /v1/launchlaser1/crash will return 401")
+	} else {
+		log.Print("launchlaser1 ingest auth enabled (LAUNCHLASER1_INGEST_API_KEY)")
 	}
 	return c
 }
@@ -227,6 +237,9 @@ func openStore(path string) (*Store, error) {
 	}
 	if err := st.ensureManRocketIngestSchema(); err != nil {
 		return nil, fmt.Errorf("manrocket ingest schema: %w", err)
+	}
+	if err := st.ensureLaunchLaser1IngestSchema(); err != nil {
+		return nil, fmt.Errorf("launchlaser1 ingest schema: %w", err)
 	}
 	if err := st.ensureManRocketLevelPlaySchema(); err != nil {
 		return nil, fmt.Errorf("manrocket level play schema: %w", err)
@@ -615,6 +628,9 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("/v1/manrocket/phrases", s.withCORS(s.manrocketPhrases))
 	mux.HandleFunc("/v1/manrocket/names/", s.withCORS(s.withRateLimit(s.manrocketNames)))
 	mux.HandleFunc("/v1/manrocket/feedback", s.withCORS(s.withRateLimit(s.manrocketFeedback)))
+	// Launch Laser 1 keyed ingest (write-only key, events + crash only).
+	mux.HandleFunc("/v1/launchlaser1/events", withIngestCORS(s.withRateLimit(s.withLaunchLaser1Auth(s.ingestLaunchLaser1Events))))
+	mux.HandleFunc("/v1/launchlaser1/crash", withIngestCORS(s.withRateLimit(s.withLaunchLaser1Auth(s.ingestLaunchLaser1Crash))))
 	return s.withLog(mux)
 }
 

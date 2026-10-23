@@ -673,6 +673,10 @@ func main() {
 		MaxHeaderBytes:    1 << 16,
 	}
 
+	retentionCtx, stopRetention := context.WithCancel(context.Background())
+	defer stopRetention()
+	store.startLaunchLaser1Retention(retentionCtx)
+
 	go func() {
 		// Log line keeps the historical process name. The product is Runed Poodle.
 		log.Printf("cynthion-telemetry listening on %s", cfg.Listen)

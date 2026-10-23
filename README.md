@@ -10,6 +10,8 @@ ManRocket is game-scoped on `/v1/manrocket/events`, `/v1/manrocket/crash`, and `
 
 - `main.go` — Cynthion ingest, store, routing
 - `manrocket_ingest.go` — ManRocket ingest under Runed Poodle (own tables + `MANROCKET_INGEST_API_KEY`)
+- `launchlaser1_ingest.go` — Launch Laser 1 ingest (events + crash only, own tables + `LAUNCHLASER1_INGEST_API_KEY`)
+- `ingest_cors.go` — CORS preflight for keyed ingest routes (itch.io HTML5 builds)
 - `Dockerfile` — multi-stage build, runs non-root on Alpine
 - `docker-compose.yml` — bound to `127.0.0.1:8090` on host (Caddy proxies via `host.docker.internal:8090`)
 - `data/` — SQLite at `./data/events.db` (WAL mode); bug-report zips in `data/bugreports/` and `data/manrocket_bugreports/`
@@ -28,6 +30,8 @@ Cynthion uses the unprefixed `/v1/events`, `/v1/crash`, and `/v1/bugreport` path
 | POST | `/v1/manrocket/events` | `X-API-Key` (`MANROCKET_INGEST_API_KEY`) | batched ManRocket gameplay events |
 | POST | `/v1/manrocket/crash` | `X-API-Key` (`MANROCKET_INGEST_API_KEY`) | ManRocket crash + log upload |
 | POST | `/v1/manrocket/bugreport` | `X-API-Key` (`MANROCKET_INGEST_API_KEY`) | ManRocket bug report (zip upload) |
+| POST | `/v1/launchlaser1/events` | `X-API-Key` (`LAUNCHLASER1_INGEST_API_KEY`) | batched Launch Laser 1 events (`launchlaser1_events`) |
+| POST | `/v1/launchlaser1/crash` | `X-API-Key` (`LAUNCHLASER1_INGEST_API_KEY`) | Launch Laser 1 crash + log upload (`launchlaser1_crashes`) |
 
 ### POST /v1/events
 

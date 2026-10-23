@@ -19,7 +19,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -153,14 +152,13 @@ func (s *Store) insertManRocketBugReport(ctx context.Context, b BugReport, recei
 	return res.LastInsertId()
 }
 
-// withManRocketAuth requires X-API-Key to match MANROCKET_INGEST_API_KEY.
+// withManRocketAuth requires X-API-Key to match one of the comma-separated
+// keys in MANROCKET_INGEST_API_KEY.
 // A missing or short key rejects every caller so an unset env var cannot
 // accidentally leave ingest open, and so it cannot accept INGEST_API_KEY.
 func (s *server) withManRocketAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := s.cfg.ManRocketAPIKey
-		got := r.Header.Get("X-API-Key")
-		if len(key) < 24 || subtle.ConstantTimeCompare([]byte(got), []byte(key)) != 1 {
+		if !ingestKeyMatches(s.cfg.ManRocketAPIKey, r.Header.Get("X-API-Key")) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -187,6 +185,13 @@ func (s *server) ingestManRocketEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many events in batch", http.StatusBadRequest)
 		return
 	}
+	if err := validateEvents(b.Events); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.allowDaily(w, r, "manrocket", "events", b.InstallID, len(b.Events)) {
+		return
+	}
 	n, err := s.store.insertManRocketEvents(r.Context(), b, time.Now().UnixMilli())
 	if err != nil {
 		log.Printf("insert manrocket events failed: %v", err)
@@ -209,6 +214,9 @@ func (s *server) ingestManRocketCrash(w http.ResponseWriter, r *http.Request) {
 	}
 	if c.InstallID == "" {
 		http.Error(w, "install_id required", http.StatusBadRequest)
+		return
+	}
+	if !s.allowDaily(w, r, "manrocket", "crashes", c.InstallID, 1) {
 		return
 	}
 	id, err := s.store.insertManRocketCrash(r.Context(), c, time.Now().UnixMilli())
@@ -239,6 +247,9 @@ func (s *server) ingestManRocketBugReport(w http.ResponseWriter, r *http.Request
 	installID := r.FormValue("install_id")
 	if installID == "" {
 		http.Error(w, "install_id required", http.StatusBadRequest)
+		return
+	}
+	if !s.allowDaily(w, r, "manrocket", "bugreports", installID, 1) {
 		return
 	}
 

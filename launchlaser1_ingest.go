@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -115,12 +114,11 @@ func (s *Store) insertLaunchLaser1Crash(ctx context.Context, c Crash, receivedAt
 	return res.LastInsertId()
 }
 
-// withLaunchLaser1Auth requires X-API-Key to match LAUNCHLASER1_INGEST_API_KEY.
+// withLaunchLaser1Auth requires X-API-Key to match one of the comma-separated
+// keys in LAUNCHLASER1_INGEST_API_KEY.
 func (s *server) withLaunchLaser1Auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := s.cfg.LaunchLaser1APIKey
-		got := r.Header.Get("X-API-Key")
-		if len(key) < 24 || subtle.ConstantTimeCompare([]byte(got), []byte(key)) != 1 {
+		if !ingestKeyMatches(s.cfg.LaunchLaser1APIKey, r.Header.Get("X-API-Key")) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -147,6 +145,13 @@ func (s *server) ingestLaunchLaser1Events(w http.ResponseWriter, r *http.Request
 		http.Error(w, "too many events in batch", http.StatusBadRequest)
 		return
 	}
+	if err := validateEvents(b.Events); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !s.allowDaily(w, r, "launchlaser1", "events", b.InstallID, len(b.Events)) {
+		return
+	}
 	n, err := s.store.insertLaunchLaser1Events(r.Context(), b, time.Now().UnixMilli())
 	if err != nil {
 		log.Printf("insert launchlaser1 events failed: %v", err)
@@ -169,6 +174,9 @@ func (s *server) ingestLaunchLaser1Crash(w http.ResponseWriter, r *http.Request)
 	}
 	if c.InstallID == "" {
 		http.Error(w, "install_id required", http.StatusBadRequest)
+		return
+	}
+	if !s.allowDaily(w, r, "launchlaser1", "crashes", c.InstallID, 1) {
 		return
 	}
 	id, err := s.store.insertLaunchLaser1Crash(r.Context(), c, time.Now().UnixMilli())

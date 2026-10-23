@@ -75,15 +75,15 @@ func loadConfig() Config {
 	}
 	// ManRocket ingest is optional at boot so a deploy without the new key
 	// cannot take down Cynthion. Those routes return 401 until it is set.
-	if len(c.ManRocketAPIKey) < 24 {
+	if len(parseIngestKeys(c.ManRocketAPIKey)) == 0 {
 		log.Print("MANROCKET_INGEST_API_KEY unset or shorter than 24 characters; POST /v1/manrocket/events, /v1/manrocket/crash, and /v1/manrocket/bugreport will return 401")
 	} else {
-		log.Print("manrocket ingest auth enabled (MANROCKET_INGEST_API_KEY)")
+		log.Printf("manrocket ingest auth enabled (MANROCKET_INGEST_API_KEY, %d key(s))", len(parseIngestKeys(c.ManRocketAPIKey)))
 	}
-	if len(c.LaunchLaser1APIKey) < 24 {
+	if len(parseIngestKeys(c.LaunchLaser1APIKey)) == 0 {
 		log.Print("LAUNCHLASER1_INGEST_API_KEY unset or shorter than 24 characters; POST /v1/launchlaser1/events and /v1/launchlaser1/crash will return 401")
 	} else {
-		log.Print("launchlaser1 ingest auth enabled (LAUNCHLASER1_INGEST_API_KEY)")
+		log.Printf("launchlaser1 ingest auth enabled (LAUNCHLASER1_INGEST_API_KEY, %d key(s))", len(parseIngestKeys(c.LaunchLaser1APIKey)))
 	}
 	return c
 }
@@ -452,6 +452,8 @@ type server struct {
 	limiter         *ipLimiter
 	bugReportDir    string
 	manrocketBugDir string
+	dailyOnce       sync.Once
+	dailyCaps       *dailyCounter
 }
 
 func (s *server) health(w http.ResponseWriter, r *http.Request) {

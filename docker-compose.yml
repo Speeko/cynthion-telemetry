@@ -21,6 +21,13 @@ services:
     networks:
       - default
       - cynthion-net
+    # Request logs carry client IPs. Rotation caps them at 5 x 10 MB, far
+    # inside the 24-month retention promised in the LL1 privacy text (LL1-TEL-2).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     deploy:
       resources:
         limits:

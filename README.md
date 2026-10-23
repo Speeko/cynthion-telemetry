@@ -11,6 +11,7 @@ ManRocket is game-scoped on `/v1/manrocket/events`, `/v1/manrocket/crash`, and `
 - `main.go` — Cynthion ingest, store, routing
 - `manrocket_ingest.go` — ManRocket ingest under Runed Poodle (own tables + `MANROCKET_INGEST_API_KEY`)
 - `launchlaser1_ingest.go` — Launch Laser 1 ingest (events + crash only, own tables + `LAUNCHLASER1_INGEST_API_KEY`)
+- `ingest_hardening.go` — game ingest guards: event_type `^[a-z0-9_.:-]{1,64}$`, payload <= 8 KB per event (400), daily caps per install_id/IP per UTC day (429 JSON: events 10k/50k, crashes 200/1k, bugreports 20/50), comma-separated ingest key lists
 - `ingest_cors.go` — CORS preflight for keyed ingest routes (itch.io HTML5 builds)
 - `Dockerfile` — multi-stage build, runs non-root on Alpine
 - `docker-compose.yml` — bound to `127.0.0.1:8090` on host (Caddy proxies via `host.docker.internal:8090`)
